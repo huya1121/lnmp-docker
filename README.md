@@ -75,14 +75,14 @@
 ### 1. 下载脚本
 
 ```bash
-wget https://raw.githubusercontent.com/your-repo/lnmp/deploy-lamp.sh
-chmod +x deploy-lamp.sh
+wget https://raw.githubusercontent.com/your-repo/lnmp/deploy-lnmp.sh
+chmod +x deploy-lnmp.sh
 ```
 
 ### 2. 运行部署
 
 ```bash
-sudo ./deploy-lamp.sh
+sudo ./deploy-lnmp.sh
 ```
 
 ### 3. 按提示操作
@@ -97,7 +97,7 @@ sudo ./deploy-lamp.sh
 ## 📋 命令行参数
 
 ```bash
-./deploy-lamp.sh [选项]
+./deploy-lnmp.sh [选项]
 
 安装和部署:
   (无参数)         完整安装向导
@@ -133,7 +133,7 @@ sudo ./deploy-lamp.sh
 ### 查看服务状态
 
 ```bash
-./deploy-lamp.sh --status
+./deploy-lnmp.sh --status
 # 或
 cd ./lnmp/data && docker compose ps
 ```
@@ -141,22 +141,22 @@ cd ./lnmp/data && docker compose ps
 ### 查看日志
 
 ```bash
-./deploy-lamp.sh --logs           # 所有服务
-./deploy-lamp.sh --logs nginx     # Nginx 日志
-./deploy-lamp.sh --logs php       # PHP 日志
-./deploy-lamp.sh --logs mysql     # MySQL 日志
+./deploy-lnmp.sh --logs           # 所有服务
+./deploy-lnmp.sh --logs nginx     # Nginx 日志
+./deploy-lnmp.sh --logs php       # PHP 日志
+./deploy-lnmp.sh --logs mysql     # MySQL 日志
 ```
 
 ### 重启服务
 
 ```bash
-./deploy-lamp.sh --restart
+./deploy-lnmp.sh --restart
 ```
 
 ### 健康检查
 
 ```bash
-./deploy-lamp.sh --health
+./deploy-lnmp.sh --health
 ```
 
 输出内容包括：
@@ -183,7 +183,7 @@ docker compose exec -T mysql mysql -u root -p"密码" < backup.sql
 ### 添加新子域名
 
 ```bash
-./deploy-lamp.sh --add-subdomain
+./deploy-lnmp.sh --add-subdomain
 ```
 
 > 注意：如果使用单域名证书，添加子域名后需要重新申请证书 (`--cert`)
@@ -191,7 +191,7 @@ docker compose exec -T mysql mysql -u root -p"密码" < backup.sql
 ### SSL 证书续期
 
 ```bash
-./deploy-lamp.sh --renew
+./deploy-lnmp.sh --renew
 ```
 
 ## ⏰ 自动任务
@@ -228,10 +228,10 @@ docker compose exec -T mysql mysql -u root -p"密码" < backup.sql
 
 ```bash
 # 查看所有服务状态
-./deploy-lamp.sh --status
+./deploy-lnmp.sh --status
 
 # 查看详细日志
-./deploy-lamp.sh --logs
+./deploy-lnmp.sh --logs
 
 # 检查端口占用
 netstat -tlnp | grep -E '80|443'
@@ -284,7 +284,7 @@ docker compose exec mysql mysql -u root -p -e "SELECT 1"
 如果安装中断，重新运行脚本会自动检测进度并询问是否继续：
 
 ```bash
-./deploy-lamp.sh
+./deploy-lnmp.sh
 # 检测到未完成的安装 (阶段: xxx)
 # 是否继续上次安装? [Y/n]:
 ```
