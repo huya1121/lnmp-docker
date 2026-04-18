@@ -3,7 +3,7 @@ set -eo pipefail
 
 # ======================== 版本和配置 ========================
 VERSION="2.2.0"
-SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/refs/heads/main/deploy-lnmp.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/your-repo/lnmp-docker/main/deploy-lamp.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
 PROJECT_NAME="lnmp"
@@ -111,9 +111,17 @@ generate_strong_password() {
         fi
     fi
     
-    # Final fallback
+    # Final fallback - use multiple sources for entropy
     if [[ -z "$result" || ${#result} -lt 8 ]]; then
-        result="SecurePass$(date +%s)$$"
+        # Combine multiple entropy sources for better randomness
+        local entropy="${RANDOM}$(date +%s%N)$$${BASHPID:-0}$(hostname 2>/dev/null)"
+        if command -v md5sum &>/dev/null; then
+            result=$(echo "$entropy" | md5sum | tr -dc 'a-zA-Z0-9' | cut -c1-"$length")
+        elif command -v md5 &>/dev/null; then
+            result=$(echo "$entropy" | md5 | tr -dc 'a-zA-Z0-9' | cut -c1-"$length")
+        else
+            result="Secure${RANDOM}Pass$(date +%s)${RANDOM}"
+        fi
     fi
     
     printf '%s' "$result"
@@ -384,59 +392,24 @@ show_help() {
     echo -e "  ${CYAN}--logs [服务]${NC}    查看日志 (nginx/php/mysql/redis)"
     echo ""
     echo -e "${BOLD}备份和维护:${NC}"
-        echo -e "  ${CYAN}--backup${NC}         立即执行备份"
-        echo -e "  ${CYAN}--info${NC}           显示当前配置信息"
-        echo -e "  ${CYAN}--health${NC}         健康检查"
-        echo ""
-        echo -e "${BOLD}高级操作:${NC}"
-        echo -e "  ${CYAN}--add-subdomain${NC}  添加新子域名"
-        echo -e "  ${CYAN}--rebuild-php${NC}    重新构建 PHP 镜像 (可选择版本)"
-        echo -e "  ${CYAN}--rebuild-mysql${NC}  重建 MySQL/MariaDB (可选择版本)"
-        echo -e "  ${CYAN}--uninstall${NC}      卸载并清理所有数据"
-        echo -e "  ${CYAN}--upgrade${NC}        升级脚本到最新版本"
-        echo -e "  ${CYAN}--cleanup${NC}        清理未使用的 Docker 资源"
-        echo ""
-        echo -e "${BOLD}其他:${NC}"
-        echo -e "  ${CYAN}--help, -h${NC}       显示此帮助信息"
-        echo -e "  ${CYAN}--version, -v${NC}    显示版本号"
-        echo ""
-        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${BOLD}${ICON_DATABASE} MySQL/MariaDB 操作指南${NC}"
-        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo ""
-        echo -e "${BOLD}进入数据库命令行:${NC}"
-        echo -e "  ${CYAN}docker exec -it lnmp_mysql mariadb -uroot -p${NC}"
-        echo ""
-        echo -e "${BOLD}数据库备份与恢复:${NC}"
-        echo -e "  ${DIM}# 导出单个数据库${NC}"
-        echo -e "  ${CYAN}docker exec lnmp_mysql mariadb-dump -uroot -p'密码' 数据库名 > backup.sql${NC}"
-        echo -e "  ${DIM}# 导出所有数据库${NC}"
-        echo -e "  ${CYAN}docker exec lnmp_mysql mariadb-dump -uroot -p'密码' --all-databases > all.sql${NC}"
-        echo -e "  ${DIM}# 导入数据库 (方式1)${NC}"
-        echo -e "  ${CYAN}docker exec -i lnmp_mysql mariadb -uroot -p'密码' 数据库名 < backup.sql${NC}"
-        echo -e "  ${DIM}# 导入数据库 (方式2 - 从任意路径导入)${NC}"
-        echo -e "  ${CYAN}cat /path/to/backup.sql | docker exec -i lnmp_mysql mariadb -uroot -p'密码' 数据库名${NC}"
-        echo ""
-        echo -e "${BOLD}数据库管理:${NC}"
-        echo -e "  ${DIM}# 创建新数据库${NC}"
-        echo -e "  ${CYAN}docker exec lnmp_mysql mariadb -uroot -p'密码' -e \"CREATE DATABASE 数据库名 CHARACTER SET utf8mb4\"${NC}"
-        echo -e "  ${DIM}# 删除数据库${NC}"
-        echo -e "  ${CYAN}docker exec lnmp_mysql mariadb -uroot -p'密码' -e \"DROP DATABASE 数据库名\"${NC}"
-        echo -e "  ${DIM}# 查看所有数据库${NC}"
-        echo -e "  ${CYAN}docker exec lnmp_mysql mariadb -uroot -p'密码' -e \"SHOW DATABASES\"${NC}"
-        echo ""
-        echo -e "${BOLD}用户管理:${NC}"
-        echo -e "  ${DIM}# 创建用户并授权${NC}"
-        echo -e "  ${CYAN}docker exec lnmp_mysql mariadb -uroot -p'密码' -e \"CREATE USER '用户'@'%' IDENTIFIED BY '密码'; GRANT ALL ON 库名.* TO '用户'@'%'; FLUSH PRIVILEGES;\"${NC}"
-        echo -e "  ${DIM}# 查看所有用户${NC}"
-        echo -e "  ${CYAN}docker exec lnmp_mysql mariadb -uroot -p'密码' -e \"SELECT user,host FROM mysql.user\"${NC}"
-        echo -e "  ${DIM}# 修改用户密码${NC}"
-        echo -e "  ${CYAN}docker exec lnmp_mysql mariadb -uroot -p'密码' -e \"ALTER USER '用户'@'%' IDENTIFIED BY '新密码'\"${NC}"
-        echo ""
-        echo -e "${DIM}提示: root密码请查看 \$PROJECT_DIR/.credentials 文件${NC}"
-        echo -e "${DIM}Nginx 配置: \$PROJECT_DIR/volumes/nginx/conf.d/${NC}"
-        echo -e "${DIM}网站目录: \$PROJECT_DIR/volumes/php/www/${NC}"
-    exit 0
+    echo -e "  ${CYAN}--backup${NC}         立即执行备份"
+    echo -e "  ${CYAN}--info${NC}           显示当前配置信息"
+    echo -e "  ${CYAN}--health${NC}         健康检查"
+    echo ""
+    echo -e "${BOLD}高级操作:${NC}"
+    echo -e "  ${CYAN}--add-subdomain${NC}  添加新子域名"
+    echo -e "  ${CYAN}--rebuild-php${NC}    重新构建 PHP 镜像 (可选择版本)"
+    echo -e "  ${CYAN}--rebuild-mysql${NC}  重建 MySQL/MariaDB (可选择版本)"
+    echo -e "  ${CYAN}--uninstall${NC}      卸载并清理所有数据"
+    echo -e "  ${CYAN}--upgrade${NC}        升级脚本到最新版本"
+    echo -e "  ${CYAN}--cleanup${NC}        清理未使用的 Docker 资源"
+    echo ""
+    echo -e "${BOLD}其他:${NC}"
+    echo -e "  ${CYAN}--help, -h${NC}       显示此帮助信息"
+    echo -e "  ${CYAN}--version, -v${NC}    显示版本号"
+    echo ""
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${ICON_DATABASE} MySQL/MariaDB 操作指南${NC}"
 }
 
 show_version() {
@@ -1548,7 +1521,17 @@ obtain_ssl_certificate() {
         # 单域名证书使用 HTTP-01 验证
         info "启动 Nginx 进行 HTTP-01 验证..."
         docker compose -f "$PROJECT_DIR/docker-compose.yml" up -d nginx
-        sleep 5
+        
+        # 等待 Nginx 启动完成
+        local wait_count=0
+        local max_wait=30
+        while [[ $wait_count -lt $max_wait ]]; do
+            if docker compose -f "$PROJECT_DIR/docker-compose.yml" ps nginx 2>/dev/null | grep -q "Up"; then
+                break
+            fi
+            sleep 1
+            wait_count=$((wait_count + 1))
+        done
         
         # 检查 Nginx 是否启动成功
         if ! docker compose -f "$PROJECT_DIR/docker-compose.yml" ps nginx | grep -q "Up"; then
@@ -1559,7 +1542,13 @@ obtain_ssl_certificate() {
         
         # Get the actual network name from docker compose
         local network_name=""
-        network_name=$(docker network ls --filter "name=${PROJECT_NAME}" --format '{{.Name}}' | grep -E '_default$|_lnmp_net$' | head -1)
+        # Wait a moment for network to be created
+        sleep 2
+        network_name=$(docker network ls --filter "name=${PROJECT_NAME}" --format '{{.Name}}' | grep -E '_default$|_net$' | head -1)
+        if [[ -z "$network_name" ]]; then
+            # Fallback: try to get network from running container
+            network_name=$(docker inspect "${PROJECT_NAME}_nginx" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null | head -1)
+        fi
         if [[ -z "$network_name" ]]; then
             network_name="${PROJECT_NAME}_default"
         fi
@@ -1656,7 +1645,7 @@ fi
 # 备份数据库 (兼容 MariaDB 和 MySQL)
 # MariaDB 10.5+ 使用 mariadb-dump，旧版本和 MySQL 使用 mysqldump
 DUMP_CMD="mariadb-dump"
-if ! docker exec lnmp_mysql which mariadb-dump &>/dev/null; then
+if ! docker exec lnmp_mysql command -v mariadb-dump &>/dev/null; then
     DUMP_CMD="mysqldump"
 fi
 
