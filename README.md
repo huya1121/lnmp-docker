@@ -117,7 +117,11 @@ sudo ./deploy-lamp.sh
 
 高级操作:
   --add-subdomain  添加新子域名
+  --rebuild-php    重新构建 PHP 镜像 (可选择版本)
+  --rebuild-mysql  重建 MySQL/MariaDB (可选择版本)
   --uninstall      卸载并清理所有数据
+  --upgrade        升级脚本到最新版本
+  --cleanup        清理未使用的 Docker 资源
 
 其他:
   --help, -h       显示帮助信息
@@ -293,7 +297,16 @@ rm ./lnmp/data/.install_progress
 
 ## 📝 更新日志
 
-### v2.0.0 (当前版本)
+### v2.2.0 (当前版本)
+- 🔧 修复备份脚本中 `which` 命令可能不存在的问题，改用 POSIX 兼容的 `command -v`
+- 🔧 改进 Nginx 启动验证：添加最多 30 秒的等待循环，替代固定 5 秒延时
+- 🔧 修复 Docker 网络检测竞态条件：增加等待时间和多种网络名称获取方式
+- 🔧 增强密码生成备选方案：使用多种熵源（RANDOM、时间戳、PID、主机名）生成更安全的随机密码
+- 🔧 修复 `show_help()` 函数中的缩进不一致问题
+- 🆕 新增高级操作命令：`--rebuild-php`、`--rebuild-mysql`、`--upgrade`、`--cleanup`
+- 🔧 改进跨平台兼容性（macOS/Linux）
+
+### v2.0.0
 - 🆕 支持通配符 SSL 证书 (DNS-01 验证)
 - 🆕 支持 Cloudflare、阿里云、DNSPod DNS 验证
 - 🆕 PHP 版本选择 (7.4 - 8.4)
