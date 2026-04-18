@@ -3,7 +3,7 @@ set -eo pipefail
 
 # ======================== 版本和配置 ========================
 VERSION="2.2.0"
-SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/refs/heads/main/deploy-lamp.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/refs/heads/main/deploy-lnmp.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
 PROJECT_NAME="lnmp"
