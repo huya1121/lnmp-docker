@@ -2,7 +2,7 @@
 set -eo pipefail
 
 # ======================== 版本和配置 ========================
-VERSION="2.2.0"
+VERSION="2.6.0"
 SCRIPT_URL="https://raw.githubusercontent.com/your-repo/lnmp-docker/main/deploy-lamp.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
@@ -21,6 +21,7 @@ DNS_PROVIDER=""
 SUBDOMAINS=()
 DOMAIN=""
 INSTALL_PHPMYADMIN="no"
+NGINX_TYPE="official"  # official (with geoip2 build) or linuxserver
 
 # 颜色和样式
 RED='\033[0;31m'
@@ -350,8 +351,10 @@ DOMAIN=$DOMAIN
 CERT_TYPE=$CERT_TYPE
 DNS_PROVIDER=$DNS_PROVIDER
 MYSQL_ROOT_PASS=$MYSQL_ROOT_PASS
+REDIS_PASSWORD=$REDIS_PASSWORD
 PHP_VERSION=$PHP_VERSION
 INSTALL_PHPMYADMIN=$INSTALL_PHPMYADMIN
+NGINX_TYPE=$NGINX_TYPE
 SUBDOMAINS=(${subdomains_str})
 EOFPROG
 }
@@ -398,6 +401,8 @@ show_help() {
     echo ""
     echo -e "${BOLD}高级操作:${NC}"
     echo -e "  ${CYAN}--add-subdomain${NC}  添加新子域名"
+    echo -e "  ${CYAN}--add-proxy${NC}      添加反向代理到宿主机服务"
+    echo -e "  ${CYAN}--rebuild-nginx${NC}  重新构建 Nginx 镜像 (可切换类型)"
     echo -e "  ${CYAN}--rebuild-php${NC}    重新构建 PHP 镜像 (可选择版本)"
     echo -e "  ${CYAN}--rebuild-mysql${NC}  重建 MySQL/MariaDB (可选择版本)"
     echo -e "  ${CYAN}--uninstall${NC}      卸载并清理所有数据"
@@ -410,6 +415,49 @@ show_help() {
     echo ""
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${BOLD}${ICON_DATABASE} MySQL/MariaDB 操作指南${NC}"
+    echo ""
+    echo -e "${DIM}  进入数据库命令行:${NC}"
+    echo -e "    docker compose exec mysql mysql -u root -p"
+    echo ""
+    echo -e "${DIM}  创建新数据库:${NC}"
+    echo -e "    docker compose exec mysql mysql -u root -p -e \"CREATE DATABASE dbname;\""
+    echo ""
+    echo -e "${DIM}  创建用户并授权:${NC}"
+    echo -e "    docker compose exec mysql mysql -u root -p -e \\"
+    echo -e "      \"CREATE USER 'user'@'%' IDENTIFIED BY 'password';\""
+    echo -e "    docker compose exec mysql mysql -u root -p -e \\"
+    echo -e "      \"GRANT ALL ON dbname.* TO 'user'@'%'; FLUSH PRIVILEGES;\""
+    echo ""
+    echo -e "${DIM}  备份数据库:${NC}"
+    echo -e "    docker compose exec mysql mysqldump -u root -p dbname > backup.sql"
+    echo -e "    docker compose exec mysql mysqldump -u root -p --all-databases > all_backup.sql"
+    echo ""
+    echo -e "${DIM}  恢复数据库:${NC}"
+    echo -e "    docker compose exec -T mysql mysql -u root -p dbname < backup.sql"
+    echo ""
+    echo -e "${DIM}  查看数据库列表:${NC}"
+    echo -e "    docker compose exec mysql mysql -u root -p -e \"SHOW DATABASES;\""
+    echo ""
+    echo -e "${DIM}  查看数据库大小:${NC}"
+    echo -e "    docker compose exec mysql mysql -u root -p -e \\"
+    echo -e "      \"SELECT table_schema, ROUND(SUM(data_length+index_length)/1024/1024,2) AS 'Size(MB)'\\"
+    echo -e "       FROM information_schema.tables GROUP BY table_schema;\""
+    echo ""
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${ICON_GEAR} Redis 操作指南${NC}"
+    echo ""
+    echo -e "${DIM}  进入 Redis 命令行:${NC}"
+    echo -e "    docker compose exec redis redis-cli -a \$REDIS_PASSWORD"
+    echo ""
+    echo -e "${DIM}  查看所有 key:${NC}"
+    echo -e "    docker compose exec redis redis-cli -a \$REDIS_PASSWORD KEYS '*'"
+    echo ""
+    echo -e "${DIM}  清空缓存:${NC}"
+    echo -e "    docker compose exec redis redis-cli -a \$REDIS_PASSWORD FLUSHALL"
+    echo ""
+    echo -e "${DIM}  查看内存使用:${NC}"
+    echo -e "    docker compose exec redis redis-cli -a \$REDIS_PASSWORD INFO memory"
+    echo ""
 }
 
 show_version() {
@@ -730,6 +778,32 @@ select_dns_provider() {
     return 0
 }
 
+select_nginx_type() {
+    step "${ICON_GEAR} 选择 Nginx 版本"
+    echo ""
+    echo -e "  ${CYAN}1)${NC} 官方 Nginx + GeoIP2 ${GREEN}← 推荐${NC}"
+    echo -e "     ${DIM}(自动构建，支持 GeoIP2 地理位置识别)${NC}"
+    echo -e "  ${CYAN}2)${NC} LinuxServer Nginx"
+    echo -e "     ${DIM}(预装 GeoIP2，更简单但镜像较大)${NC}"
+    echo -e "  ${CYAN}3)${NC} 官方 Nginx 标准版"
+    echo -e "     ${DIM}(无 GeoIP2，最小镜像)${NC}"
+    echo ""
+    printf "${GREEN}  请选择 [1-3] (默认 1): ${NC}"
+    IFS= read -r nginx_choice || nginx_choice=""
+    
+    case "$nginx_choice" in
+        2) NGINX_TYPE="linuxserver" ;;
+        3) NGINX_TYPE="standard" ;;
+        *) NGINX_TYPE="official" ;;
+    esac
+    
+    case "$NGINX_TYPE" in
+        official)    log "已选择: 官方 Nginx + GeoIP2 (需要构建)" ;;
+        linuxserver) log "已选择: LinuxServer Nginx (预装 GeoIP2)" ;;
+        standard)    log "已选择: 官方 Nginx 标准版 (无 GeoIP2)" ;;
+    esac
+}
+
 ask_phpmyadmin() {
     echo ""
     printf "${GREEN}  是否安装 phpMyAdmin? [y/N]: ${NC}"
@@ -771,6 +845,10 @@ collect_credentials() {
         MYSQL_ROOT_PASS=$(generate_strong_password)
     fi
     
+    # 生成 Redis 密码
+    REDIS_PASSWORD=$(generate_strong_password 16)
+    echo -e "  ${GREEN}${ICON_OK}${NC} 已生成 Redis 密码"
+    
     log "数据库配置完成"
 }
 
@@ -778,9 +856,26 @@ collect_credentials() {
 setup_directories() {
     step "${ICON_FOLDER} 创建目录结构"
     
-    local dirs=(
-        "$PROJECT_DIR/volumes/nginx/conf.d"
-        "$PROJECT_DIR/volumes/nginx/ssl"
+    # Directory structure depends on nginx type
+    local dirs=()
+    
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        # linuxserver/nginx uses /config directory structure
+        dirs=(
+            "$PROJECT_DIR/volumes/nginx/config/nginx/site-confs"
+            "$PROJECT_DIR/volumes/nginx/config/keys"
+        )
+    else
+        # Official nginx uses /etc/nginx structure
+        dirs=(
+            "$PROJECT_DIR/volumes/nginx/conf.d"
+            "$PROJECT_DIR/volumes/nginx/ssl"
+            "$PROJECT_DIR/docker/nginx"
+        )
+    fi
+    
+    # Common directories
+    dirs+=(
         "$PROJECT_DIR/volumes/php/www/$DOMAIN"
         "$PROJECT_DIR/volumes/php/logs"
         "$PROJECT_DIR/volumes/mysql/conf.d"
@@ -913,6 +1008,70 @@ EOFWWW
 
     log "PHP Dockerfile 创建完成 (PM: max_children=${pm_max_children})"
 }
+
+# 生成 Nginx Dockerfile (for official nginx with GeoIP2)
+setup_nginx_dockerfile() {
+    step "${ICON_GEAR} 创建 Nginx Dockerfile (GeoIP2 支持)"
+    
+    mkdir -p "$PROJECT_DIR/docker/nginx"
+    
+    cat > "$PROJECT_DIR/docker/nginx/Dockerfile" << 'EOFNGINXDOCKER'
+# Multi-stage build for Nginx with GeoIP2 module
+ARG NGINX_VERSION=1.25.3
+
+# Stage 1: Build the GeoIP2 module
+FROM nginx:${NGINX_VERSION}-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache \
+    gcc \
+    libc-dev \
+    make \
+    openssl-dev \
+    pcre2-dev \
+    zlib-dev \
+    linux-headers \
+    libxslt-dev \
+    gd-dev \
+    geoip-dev \
+    libmaxminddb-dev \
+    git
+
+# Get nginx source
+ARG NGINX_VERSION
+RUN wget "http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" -O nginx.tar.gz && \
+    tar -zxf nginx.tar.gz
+
+# Clone ngx_http_geoip2_module
+RUN git clone --depth 1 https://github.com/leev/ngx_http_geoip2_module.git
+
+# Build the module
+WORKDIR /nginx-${NGINX_VERSION}
+RUN ./configure --with-compat --add-dynamic-module=../ngx_http_geoip2_module && \
+    make modules
+
+# Stage 2: Final image
+FROM nginx:${NGINX_VERSION}-alpine
+
+# Install runtime dependencies for GeoIP2
+RUN apk add --no-cache libmaxminddb
+
+# Copy the compiled module from builder
+COPY --from=builder /nginx-${NGINX_VERSION}/objs/ngx_http_geoip2_module.so /usr/lib/nginx/modules/
+
+# Create necessary directories
+RUN mkdir -p /etc/nginx/conf.d /var/log/nginx /etc/nginx/geoip
+
+# Set permissions
+RUN chown -R nginx:nginx /var/log/nginx
+
+EXPOSE 80 443
+CMD ["nginx", "-g", "daemon off;"]
+EOFNGINXDOCKER
+
+    log "Nginx Dockerfile 创建完成 (支持 GeoIP2)"
+}
+
 # 生成优化的 Nginx 主配置
 setup_nginx_main_config() {
     step "${ICON_GEAR} 创建 Nginx 主配置 (性能优化)"
@@ -921,7 +1080,112 @@ setup_nginx_main_config() {
     local worker_connections=$(get_nginx_worker_connections)
     local client_body_buffer=$(get_nginx_client_body_buffer)
     
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        # linuxserver/nginx uses /config/nginx/ for configuration
+        _create_linuxserver_nginx_config "$worker_connections" "$client_body_buffer"
+    else
+        # Official nginx or standard nginx uses /etc/nginx/
+        _create_official_nginx_config "$worker_connections" "$client_body_buffer"
+    fi
+    
+    local geoip_status="disabled"
+    [[ "$NGINX_TYPE" != "standard" ]] && geoip_status="enabled"
+    log "Nginx 主配置创建完成 (worker_connections=${worker_connections}, geoip2 ${geoip_status})"
+}
+
+# Helper function for linuxserver nginx config
+_create_linuxserver_nginx_config() {
+    local worker_connections=$1
+    local client_body_buffer=$2
+    
+    cat > "$PROJECT_DIR/volumes/nginx/config/nginx/nginx.conf" << EOFNGINXMAIN
+# linuxserver/nginx configuration
+# GeoIP2 module for HTTP (pre-installed in linuxserver/nginx)
+load_module /usr/lib/nginx/modules/ngx_http_geoip2_module.so;
+# Note: To enable stream (TCP/UDP) GeoIP2, uncomment the following two lines:
+# load_module /usr/lib/nginx/modules/ngx_stream_module.so;
+# load_module /usr/lib/nginx/modules/ngx_stream_geoip2_module.so;
+
+user abc;
+worker_processes auto;
+worker_rlimit_nofile 65535;
+error_log /config/log/nginx/error.log warn;
+pid /run/nginx.pid;
+
+events {
+    worker_connections ${worker_connections};
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    log_format main '\$remote_addr - \$remote_user [\$time_local] "\$request" '
+                    '\$status \$body_bytes_sent "\$http_referer" '
+                    '"\$http_user_agent" "\$http_x_forwarded_for" '
+                    'rt=\$request_time uct="\$upstream_connect_time" '
+                    'uht="\$upstream_header_time" urt="\$upstream_response_time"';
+
+    access_log /config/log/nginx/access.log main buffer=16k flush=2m;
+
+    # 性能优化
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    server_tokens off;
+
+    # Gzip 压缩
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_min_length 1000;
+    gzip_types text/plain text/css text/xml application/json application/javascript
+               application/rss+xml application/atom+xml image/svg+xml;
+
+    # 缓冲区优化 (基于服务器配置: ${SERVER_TIER})
+    client_body_buffer_size ${client_body_buffer};
+    client_header_buffer_size 1k;
+    client_max_body_size 100M;
+    large_client_header_buffers 4 8k;
+
+    # 超时设置
+    client_body_timeout 30;
+    client_header_timeout 30;
+    send_timeout 30;
+
+    # 限流配置 (防止 DDoS)
+    limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=10r/s;
+    limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
+
+    # 包含虚拟主机配置 (linuxserver/nginx uses site-confs)
+    include /config/nginx/site-confs/*.conf;
+}
+EOFNGINXMAIN
+
+    log "Nginx 主配置创建完成 (worker_connections=${worker_connections}, geoip2 enabled)"
+}
+
+# Helper function for official/standard nginx config
+_create_official_nginx_config() {
+    local worker_connections=$1
+    local client_body_buffer=$2
+    
+    # Create main nginx.conf for official nginx
+    local geoip_load=""
+    if [[ "$NGINX_TYPE" == "official" ]]; then
+        geoip_load="# GeoIP2 module (compiled with official nginx)
+load_module /usr/lib/nginx/modules/ngx_http_geoip2_module.so;
+"
+    fi
+    
     cat > "$PROJECT_DIR/volumes/nginx/nginx.conf" << EOFNGINXMAIN
+# Official Nginx configuration
+${geoip_load}
 user nginx;
 worker_processes auto;
 worker_rlimit_nofile 65535;
@@ -982,8 +1246,6 @@ http {
     include /etc/nginx/conf.d/*.conf;
 }
 EOFNGINXMAIN
-
-    log "Nginx 主配置创建完成 (worker_connections=${worker_connections})"
 }
 
 # 生成 MySQL 优化配置
@@ -1087,6 +1349,153 @@ EOFPHP
     log "PHP 优化配置创建完成 (memory_limit=${memory_limit}, opcache=${opcache_memory}MB)"
 }
 
+# 获取宿主机 IP 地址 (用于 Docker 容器访问宿主机服务)
+get_host_ip() {
+    local host_ip=""
+    
+    # 方法 1: 使用 docker0 网桥 IP (Linux)
+    if command -v ip &>/dev/null; then
+        host_ip=$(ip -4 addr show docker0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+    fi
+    
+    # 方法 2: 使用默认网关 (通用)
+    if [[ -z "$host_ip" ]]; then
+        host_ip=$(ip route 2>/dev/null | grep default | awk '{print $3}' | head -1)
+    fi
+    
+    # 方法 3: 尝试获取主机的第一个非 lo 接口 IP
+    if [[ -z "$host_ip" ]]; then
+        host_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    
+    # 备用: 使用标准 Docker 桥接网络网关
+    if [[ -z "$host_ip" ]]; then
+        host_ip="172.17.0.1"
+    fi
+    
+    echo "$host_ip"
+}
+
+# Helper function to generate nginx service section for docker-compose.yml
+_generate_docker_compose_nginx() {
+    case "$NGINX_TYPE" in
+        official)
+            # Official nginx with GeoIP2 - build from Dockerfile
+            cat << 'EOFNGINXSVC'
+  nginx:
+    build:
+      context: ./docker/nginx
+      args:
+        NGINX_VERSION: 1.25.3
+    image: lnmp-nginx-geoip2:1.25.3
+    container_name: ${PROJECT_NAME}_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./volumes/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./volumes/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./volumes/nginx/ssl:/etc/nginx/ssl:ro
+      - ./volumes/php/www:/var/www/html:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    depends_on:
+      - php
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOFNGINXSVC
+            ;;
+        linuxserver)
+            # LinuxServer nginx - pre-installed GeoIP2
+            cat << 'EOFNGINXSVC'
+  nginx:
+    image: linuxserver/nginx:latest
+    container_name: ${PROJECT_NAME}_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./volumes/nginx/config:/config
+      - ./volumes/php/www:/var/www/html:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    depends_on:
+      - php
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOFNGINXSVC
+            ;;
+        standard)
+            # Standard official nginx - no GeoIP2
+            cat << 'EOFNGINXSVC'
+  nginx:
+    image: nginx:alpine
+    container_name: ${PROJECT_NAME}_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./volumes/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./volumes/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./volumes/nginx/ssl:/etc/nginx/ssl:ro
+      - ./volumes/php/www:/var/www/html:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    depends_on:
+      - php
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOFNGINXSVC
+            ;;
+    esac
+}
+
 
 setup_docker_compose() {
     step "${ICON_GEAR} 生成 Docker Compose 配置"
@@ -1115,38 +1524,16 @@ setup_docker_compose() {
         max-file: \"3\""
     fi
 
+    # Generate nginx service based on NGINX_TYPE
+    local nginx_service
+    nginx_service=$(_generate_docker_compose_nginx)
+
+    # Create docker-compose.yml
     cat > "$PROJECT_DIR/docker-compose.yml" << EOFDC
+version: "3.8"
+
 services:
-  nginx:
-    image: nginx:alpine
-    container_name: \${PROJECT_NAME}_nginx
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./volumes/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./volumes/nginx/conf.d:/etc/nginx/conf.d
-      - ./volumes/nginx/ssl:/etc/nginx/ssl
-      - ./volumes/php/www:/var/www/html
-      - ./certbot/conf:/etc/letsencrypt
-      - ./certbot/www:/var/www/certbot
-    depends_on:
-      php:
-        condition: service_started
-    networks:
-      - default
-    healthcheck:
-      test: ["CMD", "nginx", "-t"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+${nginx_service}
 
   php:
     build:
@@ -1164,6 +1551,7 @@ services:
       - MYSQL_DATABASE=\${MYSQL_DB}
       - MYSQL_ROOT_PASSWORD=\${MYSQL_ROOT_PASS}
       - REDIS_HOST=redis
+      - REDIS_PASSWORD=\${REDIS_PASSWORD}
     depends_on:
       mysql:
         condition: service_healthy
@@ -1211,7 +1599,7 @@ services:
     image: redis:alpine
     container_name: \${PROJECT_NAME}_redis
     restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru --requirepass \${REDIS_PASSWORD}
     volumes:
       - ./volumes/redis:/data
     networks:
@@ -1258,6 +1646,7 @@ MARIADB_IMAGE=$(get_mariadb_image)
 MYSQL_ROOT_PASS=$MYSQL_ROOT_PASS
 MYSQL_DB=$MYSQL_DB
 DOMAIN=$DOMAIN
+REDIS_PASSWORD=$REDIS_PASSWORD
 EOFENV
     # 安全优化: 设置 .env 文件权限为仅 root 可读
     chmod 600 "$PROJECT_DIR/.env"
@@ -1268,8 +1657,19 @@ EOFENV
 setup_nginx_initial() {
     step "${ICON_GEAR} 配置 Nginx (初始化)"
     
+    # Determine config directory based on NGINX_TYPE
+    local nginx_conf_dir
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/config/nginx/site-confs"
+    else
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
+    fi
+    
+    # Ensure directory exists
+    mkdir -p "$nginx_conf_dir"
+    
     # HTTP 重定向配置
-    cat > "$PROJECT_DIR/volumes/nginx/conf.d/00-http-redirect.conf" << 'EOFNGINX'
+    cat > "$nginx_conf_dir/00-http-redirect.conf" << 'EOFNGINX'
 server {
     listen 80 default_server;
     server_name _;
@@ -1283,7 +1683,7 @@ server {
     }
 }
 EOFNGINX
-    log "Nginx 初始配置完成"
+    log "Nginx 初始配置完成 (目录: $nginx_conf_dir)"
 }
 
 setup_nginx_final() {
@@ -1293,8 +1693,19 @@ setup_nginx_final() {
     local ssl_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
     local config_index=1
     
+    # Determine config directory based on NGINX_TYPE
+    local nginx_conf_dir
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/config/nginx/site-confs"
+    else
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
+    fi
+    
+    # Ensure directory exists
+    mkdir -p "$nginx_conf_dir"
+    
     # 主域名配置
-    cat > "$PROJECT_DIR/volumes/nginx/conf.d/0${config_index}-${DOMAIN}.conf" << EOFMAIN
+    cat > "$nginx_conf_dir/0${config_index}-${DOMAIN}.conf" << EOFMAIN
 server {
     listen 443 ssl;
     http2 on;
@@ -1336,7 +1747,7 @@ EOFMAIN
         local sub_dir="$PROJECT_DIR/volumes/php/www/${sub}.${DOMAIN}"
         mkdir -p "$sub_dir"
         
-        cat > "$PROJECT_DIR/volumes/nginx/conf.d/0${config_index}-${sub}.conf" << EOFSUB
+        cat > "$nginx_conf_dir/0${config_index}-${sub}.conf" << EOFSUB
 server {
     listen 443 ssl;
     http2 on;
@@ -1393,6 +1804,10 @@ $redis_status = "未连接";
 try {
     $redis = new Redis();
     if ($redis->connect('redis', 6379)) {
+        $redis_pass = getenv('REDIS_PASSWORD');
+        if ($redis_pass) {
+            $redis->auth($redis_pass);
+        }
         $redis->set('test_key', 'Hello Redis!');
         $redis_status = "连接成功: " . $redis->get('test_key');
     }
@@ -1460,7 +1875,9 @@ obtain_ssl_certificate() {
     done
 
     if [[ "$CERT_TYPE" == "wildcard" ]]; then
-        domains="-d $DOMAIN -d *.$DOMAIN"
+        # For wildcard certificates, we need to pass domains as separate quoted arguments
+        # to avoid shell glob expansion issues with the * character
+        local wildcard_domain="*.$DOMAIN"
         
         case "$DNS_PROVIDER" in
             cloudflare)
@@ -1469,12 +1886,17 @@ obtain_ssl_certificate() {
                 chmod 600 "$PROJECT_DIR/certbot/conf/cloudflare.ini"
                 
                 info "使用 Cloudflare DNS 验证申请通配符证书..."
+                info "申请域名: $DOMAIN 和 $wildcard_domain"
+                # Disable glob expansion and use quoted variables
+                set -f
                 docker run --rm -v "$PROJECT_DIR/certbot/conf:/etc/letsencrypt" \
                     certbot/dns-cloudflare certonly --dns-cloudflare \
                     --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
                     --dns-cloudflare-propagation-seconds 30 \
-                    $domains --email "admin@$DOMAIN" --agree-tos --non-interactive \
-                    || { show_cert_retry_hint; return 1; }
+                    -d "$DOMAIN" -d "$wildcard_domain" \
+                    --email "admin@$DOMAIN" --agree-tos --non-interactive \
+                    || { set +f; show_cert_retry_hint; return 1; }
+                set +f
                 ;;
             aliyun)
                 mkdir -p "$PROJECT_DIR/certbot/conf"
@@ -1488,10 +1910,13 @@ obtain_ssl_certificate() {
                 IFS= read -r ali_choice || ali_choice=""
                 
                 if [[ "$ali_choice" == "1" ]]; then
+                    info "申请域名: $DOMAIN 和 $wildcard_domain"
+                    set -f
                     docker run -it --rm -v "$PROJECT_DIR/certbot/conf:/etc/letsencrypt" \
                         certbot/certbot certonly --manual --preferred-challenges dns \
-                        $domains --email "admin@$DOMAIN" --agree-tos \
-                        || { show_cert_retry_hint; return 1; }
+                        -d "$DOMAIN" -d "$wildcard_domain" --email "admin@$DOMAIN" --agree-tos \
+                        || { set +f; show_cert_retry_hint; return 1; }
+                    set +f
                 else
                     return 1
                 fi
@@ -1508,10 +1933,13 @@ obtain_ssl_certificate() {
                 IFS= read -r dp_choice || dp_choice=""
                 
                 if [[ "$dp_choice" == "1" ]]; then
+                    info "申请域名: $DOMAIN 和 $wildcard_domain"
+                    set -f
                     docker run -it --rm -v "$PROJECT_DIR/certbot/conf:/etc/letsencrypt" \
                         certbot/certbot certonly --manual --preferred-challenges dns \
-                        $domains --email "admin@$DOMAIN" --agree-tos \
-                        || { show_cert_retry_hint; return 1; }
+                        -d "$DOMAIN" -d "$wildcard_domain" --email "admin@$DOMAIN" --agree-tos \
+                        || { set +f; show_cert_retry_hint; return 1; }
+                    set +f
                 else
                     return 1
                 fi
@@ -1577,7 +2005,7 @@ setup_cert_renewal() {
 set -e
 cd "$(dirname "$0")"
 LOG_FILE="./cert-renewal.log"
-
+docker ps -a | grep certbot | awk '{print $1}' | xargs -r docker rm -f
 echo "[$(date)] 开始检查证书续期..." >> "$LOG_FILE"
 
 # 尝试续期证书
@@ -1730,6 +2158,7 @@ save_credentials() {
 子域名: ${SUBDOMAINS[*]}
 MySQL Root 密码: $MYSQL_ROOT_PASS
 MySQL 数据库: $MYSQL_DB
+Redis 密码: $REDIS_PASSWORD
 PHP 版本: $PHP_VERSION
 # ==========================================
 EOFCRED
@@ -1744,7 +2173,10 @@ EOFCRED
 $PROJECT_DIR/
 ├── docker-compose.yml
 ├── volumes/
-│   ├── nginx/conf.d/    # Nginx 配置
+│   ├── nginx/config/    # Nginx 配置 (linuxserver/nginx)
+│   │   └── nginx/
+│   │       ├── nginx.conf       # 主配置文件
+│   │       └── site-confs/      # 虚拟主机配置
 │   ├── php/www/         # 网站文件
 │   ├── mysql/
 │   │   ├── data/        # 数据库数据文件
@@ -1922,6 +2354,8 @@ cmd_add_subdomain() {
         error "请先完成初始安装"
     fi
     source "$PROJECT_DIR/.env"
+    # Load NGINX_TYPE from progress file if not set
+    source "$PROGRESS_FILE" 2>/dev/null || true
     
     printf "${GREEN}  请输入新子域名 (不含主域名): ${NC}"
     IFS= read -r new_sub || new_sub=""
@@ -1930,12 +2364,20 @@ cmd_add_subdomain() {
     local sub_dir="$PROJECT_DIR/volumes/php/www/${new_sub}.${DOMAIN}"
     mkdir -p "$sub_dir"
     
+    # Determine config directory based on NGINX_TYPE
+    local nginx_conf_dir
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/config/nginx/site-confs"
+    else
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
+    fi
+    
     local ssl_cert="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
     local ssl_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-    local config_num=$(ls -1 "$PROJECT_DIR/volumes/nginx/conf.d/" | wc -l)
+    local config_num=$(ls -1 "$nginx_conf_dir/" 2>/dev/null | wc -l)
     config_num=$((config_num + 1))
     
-    cat > "$PROJECT_DIR/volumes/nginx/conf.d/0${config_num}-${new_sub}.conf" << EOFNEWSUB
+    cat > "$nginx_conf_dir/0${config_num}-${new_sub}.conf" << EOFNEWSUB
 server {
     listen 443 ssl;
     http2 on;
@@ -1981,6 +2423,205 @@ EOFHTML
     log "子域名 ${new_sub}.${DOMAIN} 添加成功"
     info "网站目录: $sub_dir"
     warn "如果使用单域名证书，需要重新申请证书以包含新子域名"
+}
+
+cmd_add_proxy() {
+    step "${ICON_GLOBE} 添加反向代理配置"
+    
+    if [[ ! -f "$PROJECT_DIR/.env" ]]; then
+        error "请先完成初始安装"
+    fi
+    source "$PROJECT_DIR/.env"
+    source "$PROGRESS_FILE" 2>/dev/null || true
+    
+    echo ""
+    echo -e "  ${BOLD}反向代理配置向导${NC}"
+    echo -e "  ${DIM}用于将 Nginx 请求转发到宿主机上运行的服务${NC}"
+    echo -e "  ${DIM}容器通过 host.docker.internal 访问宿主机${NC}"
+    echo ""
+    
+    printf "${GREEN}  请输入子域名 (不含主域名，如 api): ${NC}"
+    IFS= read -r proxy_sub || proxy_sub=""
+    [[ -z "$proxy_sub" ]] && error "子域名不能为空"
+    
+    printf "${GREEN}  请输入宿主机端口 (如 3000): ${NC}"
+    IFS= read -r host_port || host_port=""
+    [[ -z "$host_port" ]] && error "端口不能为空"
+    
+    if ! [[ "$host_port" =~ ^[0-9]+$ ]] || [[ "$host_port" -lt 1 ]] || [[ "$host_port" -gt 65535 ]]; then
+        error "无效的端口号: $host_port"
+    fi
+    
+    echo ""
+    echo -e "  ${CYAN}代理协议:${NC}"
+    echo -e "  ${CYAN}1)${NC} HTTP (默认)"
+    echo -e "  ${CYAN}2)${NC} HTTPS"
+    printf "${GREEN}  请选择 [1-2] (默认 1): ${NC}"
+    IFS= read -r proto_choice || proto_choice="1"
+    
+    local upstream_proto="http"
+    [[ "$proto_choice" == "2" ]] && upstream_proto="https"
+    
+    local nginx_conf_dir
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/config/nginx/site-confs"
+    else
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
+    fi
+    
+    local ssl_cert="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    local ssl_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+    local config_num=$(ls -1 "$nginx_conf_dir/" 2>/dev/null | wc -l)
+    config_num=$((config_num + 1))
+    
+    cat > "$nginx_conf_dir/0${config_num}-proxy-${proxy_sub}.conf" << EOFPROXY
+# 反向代理: ${proxy_sub}.${DOMAIN} -> host.docker.internal:${host_port}
+upstream ${proxy_sub}_backend {
+    server host.docker.internal:${host_port};
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name ${proxy_sub}.${DOMAIN};
+
+    ssl_certificate $ssl_cert;
+    ssl_certificate_key $ssl_key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+    ssl_prefer_server_ciphers off;
+
+    add_header Strict-Transport-Security "max-age=63072000" always;
+    add_header X-Frame-Options SAMEORIGIN;
+    add_header X-Content-Type-Options nosniff;
+
+    location / {
+        proxy_pass ${upstream_proto}://${proxy_sub}_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+}
+
+server {
+    listen 80;
+    server_name ${proxy_sub}.${DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
+EOFPROXY
+
+    cd "$PROJECT_DIR"
+    if docker compose exec -T nginx nginx -t 2>/dev/null; then
+        docker compose exec -T nginx nginx -s reload
+        log "反向代理配置成功: ${proxy_sub}.${DOMAIN} -> host:${host_port}"
+    else
+        warn "Nginx 配置测试失败，请检查配置文件"
+        docker compose exec -T nginx nginx -t
+    fi
+    
+    echo ""
+    echo -e "  ${BOLD}配置详情:${NC}"
+    echo -e "    访问地址: https://${proxy_sub}.${DOMAIN}"
+    echo -e "    代理目标: ${upstream_proto}://host.docker.internal:${host_port}"
+    echo -e "    配置文件: $nginx_conf_dir/0${config_num}-proxy-${proxy_sub}.conf"
+    echo ""
+    warn "请确保宿主机服务监听在 0.0.0.0:${host_port} 而非 127.0.0.1:${host_port}"
+    info "如使用通配符证书，代理将立即生效；否则需重新申请证书"
+}
+
+cmd_rebuild_nginx() {
+    step "${ICON_GEAR} 重新构建 Nginx 镜像"
+    
+    if [[ ! -f "$PROJECT_DIR/.env" ]]; then
+        error "请先完成初始安装"
+    fi
+    source "$PROJECT_DIR/.env"
+    source "$PROGRESS_FILE" 2>/dev/null || true
+    
+    local current_type=${NGINX_TYPE:-official}
+    echo ""
+    echo -e "  ${BOLD}当前 Nginx 类型:${NC} ${CYAN}$current_type${NC}"
+    echo ""
+    echo -e "  ${CYAN}1)${NC} 使用当前类型重新构建/拉取"
+    echo -e "  ${CYAN}2)${NC} 切换到其他 Nginx 类型"
+    echo -e "  ${CYAN}0)${NC} 取消"
+    echo ""
+    printf "${GREEN}  请选择 [0-2]: ${NC}"
+    IFS= read -r rebuild_choice || rebuild_choice=""
+    
+    case "$rebuild_choice" in
+        0) info "操作已取消"; return 0 ;;
+        2)
+            echo ""
+            echo -e "  ${CYAN}1)${NC} 官方 Nginx + GeoIP2 ${GREEN}← 推荐${NC}"
+            echo -e "  ${CYAN}2)${NC} LinuxServer Nginx"
+            echo -e "  ${CYAN}3)${NC} 官方 Nginx 标准版"
+            printf "${GREEN}  请选择 [1-3]: ${NC}"
+            IFS= read -r type_choice || type_choice=""
+            case "$type_choice" in
+                1) NGINX_TYPE="official" ;;
+                2) NGINX_TYPE="linuxserver" ;;
+                3) NGINX_TYPE="standard" ;;
+                *) NGINX_TYPE="$current_type" ;;
+            esac
+            if [[ "$NGINX_TYPE" != "$current_type" ]]; then
+                if [[ -f "$PROGRESS_FILE" ]]; then
+                    if grep -q "^NGINX_TYPE=" "$PROGRESS_FILE"; then
+                        sed -i "s/^NGINX_TYPE=.*/NGINX_TYPE=$NGINX_TYPE/" "$PROGRESS_FILE" 2>/dev/null || \
+                        sed -i '' "s/^NGINX_TYPE=.*/NGINX_TYPE=$NGINX_TYPE/" "$PROGRESS_FILE"
+                    else
+                        echo "NGINX_TYPE=$NGINX_TYPE" >> "$PROGRESS_FILE"
+                    fi
+                fi
+                log "Nginx 类型已更新为: $NGINX_TYPE"
+                setup_directories
+                setup_nginx_main_config
+                [[ "$NGINX_TYPE" == "official" ]] && setup_nginx_dockerfile
+                setup_docker_compose
+            fi
+            ;;
+        1|*) ;; # 使用当前类型
+    esac
+    
+    cd "$PROJECT_DIR"
+    info "停止 Nginx 容器..."
+    docker compose stop nginx
+    docker compose rm -f nginx 2>/dev/null || true
+    
+    case "$NGINX_TYPE" in
+        official)
+            docker images -q "lnmp-nginx-geoip2:*" 2>/dev/null | xargs -r docker rmi 2>/dev/null || true
+            info "构建 Nginx + GeoIP2 镜像..."
+            docker compose build --no-cache nginx
+            ;;
+        linuxserver)
+            info "拉取 LinuxServer Nginx 镜像..."
+            docker pull linuxserver/nginx:latest
+            ;;
+        standard)
+            info "拉取官方 Nginx Alpine 镜像..."
+            docker pull nginx:alpine
+            ;;
+    esac
+    
+    info "启动 Nginx 容器..."
+    docker compose up -d nginx
+    sleep 3
+    
+    if docker compose ps nginx | grep -q "Up"; then
+        log "Nginx 重建完成！"
+        docker compose exec -T nginx nginx -v 2>/dev/null || echo "  (无法获取版本)"
+    else
+        error "Nginx 容器启动失败，请检查日志: docker compose logs nginx"
+    fi
 }
 
 cmd_rebuild_php() {
@@ -2315,14 +2956,24 @@ cmd_cert_only() {
     if [[ ! -f "$PROJECT_DIR/.env" ]]; then
         # 首次申请，需要收集信息
         collect_domain_info
-        select_cert_type
     else
         source "$PROJECT_DIR/.env"
         source "$PROGRESS_FILE" 2>/dev/null || true
     fi
     
+    # 总是询问证书类型（用户可能想更改类型）
+    select_cert_type
+    
     obtain_ssl_certificate || exit 1
     setup_nginx_final
+    
+    # 保存证书类型到 .env
+    if [[ -f "$PROJECT_DIR/.env" ]] && ! grep -q "^CERT_TYPE=" "$PROJECT_DIR/.env"; then
+        echo "CERT_TYPE=$CERT_TYPE" >> "$PROJECT_DIR/.env"
+    fi
+    if [[ -n "$DNS_PROVIDER" ]] && ! grep -q "^DNS_PROVIDER=" "$PROJECT_DIR/.env"; then
+        echo "DNS_PROVIDER=$DNS_PROVIDER" >> "$PROJECT_DIR/.env"
+    fi
     
     cd "$PROJECT_DIR"
     docker compose restart nginx
@@ -2523,6 +3174,7 @@ run_full_install() {
         if [[ -z "$DOMAIN" ]]; then
             collect_domain_info
         fi
+        select_nginx_type
         if [[ -z "$CERT_TYPE" || "$CERT_TYPE" == "single" ]]; then
             select_cert_type
         fi
@@ -2545,6 +3197,10 @@ run_full_install() {
         setup_php_dockerfile
         setup_php_ini_config
         setup_mysql_config
+        # Build nginx dockerfile for official nginx with GeoIP2
+        if [[ "$NGINX_TYPE" == "official" ]]; then
+            setup_nginx_dockerfile
+        fi
         setup_nginx_main_config
         setup_docker_compose
         save_progress "nginx_init"
@@ -2647,7 +3303,11 @@ run_full_install() {
     echo -e "  ${ICON_FOLDER} ${BOLD}文件位置:${NC}"
     echo -e "     项目目录: $PROJECT_DIR"
     echo -e "     网站目录: $PROJECT_DIR/volumes/php/www/"
-    echo -e "     Nginx配置: $PROJECT_DIR/volumes/nginx/conf.d/"
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        echo -e "     Nginx配置: $PROJECT_DIR/volumes/nginx/config/nginx/site-confs/"
+    else
+        echo -e "     Nginx配置: $PROJECT_DIR/volumes/nginx/conf.d/"
+    fi
     echo ""
     echo -e "  ${ICON_GEAR} ${BOLD}常用命令:${NC}"
     echo -e "     $0 --status    查看状态"
@@ -2697,6 +3357,12 @@ main() {
             ;;
         --add-subdomain)
             cmd_add_subdomain
+            ;;
+        --add-proxy)
+            cmd_add_proxy
+            ;;
+        --rebuild-nginx)
+            cmd_rebuild_nginx
             ;;
         --rebuild-php)
             cmd_rebuild_php
