@@ -22,6 +22,9 @@ SUBDOMAINS=()
 DOMAIN=""
 INSTALL_PHPMYADMIN="no"
 NGINX_TYPE="official"  # official (with geoip2 build) or linuxserver
+# 官方 Nginx 镜像基于 nginx:alpine (始终为最新稳定版)。GeoIP2 动态模块会在
+# 构建时自动探测该基础镜像的 nginx 版本并下载对应源码编译，
+# 因此无需在此固定版本号 —— 永远跟随最新 nginx。
 
 # 颜色和样式
 RED='\033[0;31m'
@@ -1063,10 +1066,11 @@ setup_nginx_dockerfile() {
     
     cat > "$PROJECT_DIR/docker/nginx/Dockerfile" << 'EOFNGINXDOCKER'
 # Multi-stage build for Nginx with GeoIP2 module
-ARG NGINX_VERSION=1.25.3
+# 基础镜像 nginx:alpine 始终为最新稳定版；构建时自动探测其精确版本并下载
+# 对应源码编译 GeoIP2 动态模块，无需手动指定版本号 —— 永远跟随最新 nginx。
 
-# Stage 1: Build the GeoIP2 module
-FROM nginx:${NGINX_VERSION}-alpine AS builder
+# Stage 1: Build the GeoIP2 module against the exact nginx version in the base image
+FROM nginx:alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -1083,21 +1087,21 @@ RUN apk add --no-cache \
     libmaxminddb-dev \
     git
 
-# Get nginx source
-ARG NGINX_VERSION
-RUN wget "http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" -O nginx.tar.gz && \
-    tar -zxf nginx.tar.gz
+# 探测基础镜像的 nginx 版本 -> 下载完全匹配的源码 -> 编译 GeoIP2 模块。
+# --with-compat 保证动态模块与运行镜像二进制兼容。
+RUN set -eux; \
+    NGINX_VERSION="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"; \
+    echo "Building GeoIP2 module for nginx ${NGINX_VERSION}"; \
+    wget "http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" -O nginx.tar.gz; \
+    tar -zxf nginx.tar.gz; \
+    git clone --depth 1 https://github.com/leev/ngx_http_geoip2_module.git; \
+    cd "nginx-${NGINX_VERSION}"; \
+    ./configure --with-compat --add-dynamic-module=../ngx_http_geoip2_module; \
+    make modules; \
+    cp objs/ngx_http_geoip2_module.so /tmp/ngx_http_geoip2_module.so
 
-# Clone ngx_http_geoip2_module
-RUN git clone --depth 1 https://github.com/leev/ngx_http_geoip2_module.git
-
-# Build the module
-WORKDIR /nginx-${NGINX_VERSION}
-RUN ./configure --with-compat --add-dynamic-module=../ngx_http_geoip2_module && \
-    make modules
-
-# Stage 2: Final image
-FROM nginx:${NGINX_VERSION}-alpine
+# Stage 2: Final image (same nginx:alpine -> same version as the module was built for)
+FROM nginx:alpine
 
 # 时区 (中国标准时间)
 ENV TZ=Asia/Shanghai
@@ -1108,7 +1112,7 @@ RUN apk add --no-cache libmaxminddb tzdata \
     && echo "Asia/Shanghai" > /etc/timezone
 
 # Copy the compiled module from builder
-COPY --from=builder /nginx-${NGINX_VERSION}/objs/ngx_http_geoip2_module.so /usr/lib/nginx/modules/
+COPY --from=builder /tmp/ngx_http_geoip2_module.so /usr/lib/nginx/modules/
 
 # Create necessary directories
 RUN mkdir -p /etc/nginx/conf.d /var/log/nginx /etc/nginx/geoip
@@ -1436,13 +1440,15 @@ _generate_docker_compose_nginx() {
     case "$NGINX_TYPE" in
         official)
             # Official nginx with GeoIP2 - build from Dockerfile
+            # 镜像在构建时自动跟随最新 nginx:alpine，无需版本 build arg
             cat << 'EOFNGINXSVC'
   nginx:
     build:
       context: ./docker/nginx
-      args:
-        NGINX_VERSION: 1.25.3
-    image: lnmp-nginx-geoip2:1.25.3
+    image: lnmp-nginx-geoip2:latest
+    # 本地构建镜像，不在任何仓库；强制 compose 构建而非拉取，
+    # 避免 "pull access denied for lnmp-nginx-geoip2" 错误
+    pull_policy: build
     container_name: ${PROJECT_NAME}_nginx
     restart: unless-stopped
     environment:
@@ -2018,7 +2024,10 @@ obtain_ssl_certificate() {
     else
         # 单域名证书使用 HTTP-01 验证
         info "启动 Nginx 进行 HTTP-01 验证..."
-        docker compose -f "$PROJECT_DIR/docker-compose.yml" up -d nginx
+        # 官方 Nginx 使用本地构建的 lnmp-nginx-geoip2 镜像 (不在任何仓库)，
+        # 必须用 --build 让 compose 先构建，否则会误当作可拉取镜像而报
+        # "pull access denied ... repository does not exist"
+        docker compose -f "$PROJECT_DIR/docker-compose.yml" up -d --build nginx
         
         # 等待 Nginx 启动完成
         local wait_count=0
@@ -3457,8 +3466,10 @@ run_full_install() {
         wait
         
         info "启动所有服务..."
-        docker compose up -d
-        
+        # --build 确保官方 Nginx 的本地镜像 (lnmp-nginx-geoip2) 被构建，
+        # 通配符证书场景下 Nginx 首次启动在此，需在此构建
+        docker compose up -d --build
+
         info "等待服务启动..."
         sleep 5
         
