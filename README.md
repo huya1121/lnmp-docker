@@ -302,6 +302,33 @@ docker compose exec redis redis-cli -a "Redis密码" FLUSHDB
 
 > 首次重建镜像可能耗时几分钟。redis / 标准 Nginx / certbot 容器跟随宿主机时区，建议宿主机执行 `timedatectl set-timezone Asia/Shanghai`。
 
+#### `--reconfig` 会导致数据丢失吗？
+
+**不会。** `--reconfig` 不执行 `docker compose down -v`、不删除任何数据卷、不改动数据目录。数据库数据、网站文件、SSL 证书、Redis 数据都存放在**绑定挂载的卷**里（`./volumes/mysql/data`、`./volumes/php/www`、`./certbot/conf`、`./volumes/redis`），重建容器时会原样重新挂回。它也不调用初始化站点 / 申请证书 / 写首页的逻辑，因此证书与已加子域名配置都保留。
+
+不过在**旧部署**上执行前，请留意以下几点（多为潜在坑，并非必然丢数据）：
+
+1. **确认 MariaDB 版本一致（最重要）**：重生成的 `docker-compose.yml` 会按 `.env` 里的 `MARIADB_VERSION` 选镜像。若旧 `.env` 缺该值，会回落到脚本默认版本——万一与实际运行版本不同，`up -d` 会用新版本容器挂旧数据，跨大版本可能需要 `mysql_upgrade`。执行前请对比：
+   ```bash
+   grep -E 'MARIADB_VERSION|PHP_VERSION' .env
+   docker compose exec mysql mariadb --version
+   ```
+2. **卷路径需一致**：若旧部署使用了不同的卷布局（命名卷或其他路径），数据不会被删除，但新配置可能挂到空目录、看起来"像丢了"。使用本 `volumes/` 结构的部署无此问题。
+3. **行为变化（非丢数据）**：MySQL 新增 `default-time-zone = '+08:00'`，已存 `TIMESTAMP` 值不变，但 `NOW()` 与时间显示按东八区；Redis 新增 `--maxmemory-policy allkeys-lru`，若把 Redis 当持久存储用（非纯缓存），内存满时会淘汰 key。
+4. **短暂停机**：重建容器期间服务会中断几十秒到几分钟。
+5. **自定义特殊字符密码**：脚本自动生成的密码为纯字母数字，安全；若手填过含 `$`、反引号、引号的密码，`.env` 经 source→重写可能损坏导致登录失败（连不上，非丢数据）。
+
+**稳妥流程：**
+
+```bash
+cd ./lnmp
+./deploy-lamp.sh --backup                    # 1. 先备份 (数据库+网站 → backups/)
+grep -E 'MARIADB_VERSION|PHP_VERSION' .env   # 2. 确认版本值存在
+docker compose exec mysql mariadb --version  #    对比实际运行版本
+./deploy-lamp.sh --reconfig                  # 3. 执行 (会显示拓扑让你确认)
+./deploy-lamp.sh --health                    # 4. 检查各服务
+```
+
 ### 添加新子域名
 
 ```bash
