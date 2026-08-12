@@ -288,28 +288,52 @@ get_php_opcache_memory() {
     esac
 }
 
+# 根据实际可用内存计算 pm.max_children，避免 PHP-FPM 进程数 × memory_limit
+# 超过物理内存导致 OOM (爆内存)。原来的固定档位值 (如 medium=25) 在
+# 25 × 128M = 3.2G 时会远超中低配服务器内存。
 get_php_pm_max_children() {
+    # 每个子进程的内存上限 (memory_limit, 去掉 M 后缀)
+    local mem_limit; mem_limit=$(get_php_memory_limit); mem_limit=${mem_limit%M}
+
+    # 实际平均每进程占用按 memory_limit 的一半估算 (极少请求会吃满上限)，最低 32M
+    local per_child=$(( mem_limit / 2 ))
+    [[ $per_child -lt 32 ]] && per_child=32
+
+    # 预留内存给 MySQL / Redis / 系统后，PHP 可用内存约为总内存的 45%
+    local php_avail=$(( SERVER_MEM_MB * 45 / 100 ))
+    local result=$(( php_avail / per_child ))
+
+    # 保留原有档位作为上限，内存充足时不会超过原来的行为
+    local cap
     case "$SERVER_TIER" in
-        low)    echo "10" ;;
-        medium) echo "25" ;;
-        high)   echo "50" ;;
+        low)    cap=10 ;;
+        medium) cap=25 ;;
+        high)   cap=50 ;;
         ultra)
-            local max_children=$(( SERVER_CPU_CORES * 10 ))
-            [[ $max_children -lt 50 ]] && max_children=50
-            [[ $max_children -gt 200 ]] && max_children=200
-            echo "$max_children"
+            cap=$(( SERVER_CPU_CORES * 10 ))
+            [[ $cap -lt 50 ]] && cap=50
+            [[ $cap -gt 200 ]] && cap=200
             ;;
     esac
+    [[ $result -gt $cap ]] && result=$cap
+    [[ $result -lt 4 ]] && result=4
+    echo "$result"
 }
 
 get_php_pm_start_servers() {
     local max_children=$(get_php_pm_max_children)
-    echo $(( max_children / 5 ))
+    local n=$(( max_children / 5 ))
+    # PHP-FPM 动态模式要求该值 >= 1，低内存下 max_children 较小时需兜底
+    [[ $n -lt 1 ]] && n=1
+    echo "$n"
 }
 
 get_php_pm_min_spare() {
     local max_children=$(get_php_pm_max_children)
-    echo $(( max_children / 5 ))
+    local n=$(( max_children / 5 ))
+    # pm.min_spare_servers 必须为正数，否则 PHP-FPM 拒绝启动
+    [[ $n -lt 1 ]] && n=1
+    echo "$n"
 }
 
 get_php_pm_max_spare() {
@@ -336,6 +360,16 @@ get_nginx_client_body_buffer() {
     esac
 }
 
+# Redis 最大内存 (根据服务器配置，避免固定 128M 在低配机上挤占内存)
+get_redis_maxmemory() {
+    case "$SERVER_TIER" in
+        low)    echo "64mb" ;;
+        medium) echo "128mb" ;;
+        high)   echo "256mb" ;;
+        ultra)  echo "512mb" ;;
+    esac
+}
+
 # ======================== 进度管理 ========================
 save_progress() {
     local stage=$1
@@ -357,6 +391,8 @@ INSTALL_PHPMYADMIN=$INSTALL_PHPMYADMIN
 NGINX_TYPE=$NGINX_TYPE
 SUBDOMAINS=(${subdomains_str})
 EOFPROG
+    # 进度文件含数据库/Redis 密码，限制为仅 root 可读
+    chmod 600 "$PROGRESS_FILE" 2>/dev/null || true
 }
 
 load_progress() { [[ -f "$PROGRESS_FILE" ]] && source "$PROGRESS_FILE" && return 0; return 1; }
@@ -405,6 +441,7 @@ show_help() {
     echo -e "  ${CYAN}--rebuild-nginx${NC}  重新构建 Nginx 镜像 (可切换类型)"
     echo -e "  ${CYAN}--rebuild-php${NC}    重新构建 PHP 镜像 (可选择版本)"
     echo -e "  ${CYAN}--rebuild-mysql${NC}  重建 MySQL/MariaDB (可选择版本)"
+    echo -e "  ${CYAN}--reconfig${NC}       从现有 .env 重新生成配置并重建 (应用时区/内存/续期/备份等修复，不动数据)"
     echo -e "  ${CYAN}--uninstall${NC}      卸载并清理所有数据"
     echo -e "  ${CYAN}--upgrade${NC}        升级脚本到最新版本"
     echo -e "  ${CYAN}--cleanup${NC}        清理未使用的 Docker 资源"
@@ -915,6 +952,9 @@ setup_php_dockerfile() {
 ARG PHP_VERSION=8.2
 FROM php:${PHP_VERSION}-fpm-alpine
 
+# 时区 (中国标准时间)，需配合下方安装的 tzdata 包生效
+ENV TZ=Asia/Shanghai
+
 # 在单个 RUN 层中完成所有构建操作以最小化镜像体积
 # 1. 安装运行时依赖 (永久保留)
 # 2. 安装编译依赖 (临时，使用 --virtual 标记)
@@ -932,6 +972,7 @@ RUN set -eux; \
         oniguruma \
         icu-libs \
         fcgi \
+        tzdata \
     ; \
     apk add --no-cache --virtual .build-deps \
         $PHPIZE_DEPS \
@@ -957,6 +998,8 @@ RUN set -eux; \
 
 # 配置和健康检查 (合并为一层减少体积)
 RUN mkdir -p /var/log/php && chown www-data:www-data /var/log/php \
+    && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone \
     && printf '#!/bin/sh\nSCRIPT_NAME=/ping SCRIPT_FILENAME=/ping REQUEST_METHOD=GET cgi-fcgi -bind -connect 127.0.0.1:9000 2>/dev/null | grep -q pong\n' > /usr/local/bin/php-fpm-healthcheck \
     && chmod +x /usr/local/bin/php-fpm-healthcheck
 
@@ -992,6 +1035,9 @@ pm.min_spare_servers = ${pm_min_spare}
 pm.max_spare_servers = ${pm_max_spare}
 pm.max_requests = 1000
 pm.process_idle_timeout = 10s
+
+; 内存保护: 单个请求超时强制回收，防止卡死请求持续占用内存
+request_terminate_timeout = 300s
 
 ; 状态和健康检查
 pm.status_path = /status
@@ -1053,8 +1099,13 @@ RUN ./configure --with-compat --add-dynamic-module=../ngx_http_geoip2_module && 
 # Stage 2: Final image
 FROM nginx:${NGINX_VERSION}-alpine
 
-# Install runtime dependencies for GeoIP2
-RUN apk add --no-cache libmaxminddb
+# 时区 (中国标准时间)
+ENV TZ=Asia/Shanghai
+
+# Install runtime dependencies for GeoIP2 (含 tzdata 使时区生效)
+RUN apk add --no-cache libmaxminddb tzdata \
+    && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone
 
 # Copy the compiled module from builder
 COPY --from=builder /nginx-${NGINX_VERSION}/objs/ngx_http_geoip2_module.so /usr/lib/nginx/modules/
@@ -1265,6 +1316,10 @@ character-set-server = utf8mb4
 collation-server = utf8mb4_unicode_ci
 default-storage-engine = InnoDB
 
+# 时区: 使用 +08:00 偏移量 (中国标准时间)，无需加载时区表
+# 保证 NOW()、时间戳字段等返回中国时间
+default-time-zone = '+08:00'
+
 # InnoDB 优化 (基于服务器配置: ${SERVER_TIER})
 innodb_buffer_pool_size = ${innodb_buffer}
 innodb_log_file_size = 64M
@@ -1390,6 +1445,8 @@ _generate_docker_compose_nginx() {
     image: lnmp-nginx-geoip2:1.25.3
     container_name: ${PROJECT_NAME}_nginx
     restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
     ports:
       - "80:80"
       - "443:443"
@@ -1476,6 +1533,8 @@ EOFNGINXSVC
       - ./volumes/php/www:/var/www/html:ro
       - ./certbot/conf:/etc/letsencrypt:ro
       - ./certbot/www:/var/www/certbot:ro
+      # 标准 nginx:alpine 无 tzdata，挂载宿主机时区文件使日志时间为中国时间
+      - /etc/localtime:/etc/localtime:ro
     depends_on:
       - php
     networks:
@@ -1510,6 +1569,7 @@ setup_docker_compose() {
     ports:
       - \"8080:80\"
     environment:
+      - TZ=Asia/Shanghai
       - PMA_HOST=mysql
       - PMA_PORT=3306
       - UPLOAD_LIMIT=100M
@@ -1530,8 +1590,6 @@ setup_docker_compose() {
 
     # Create docker-compose.yml
     cat > "$PROJECT_DIR/docker-compose.yml" << EOFDC
-version: "3.8"
-
 services:
 ${nginx_service}
 
@@ -1547,6 +1605,7 @@ ${nginx_service}
       - ./volumes/php/www:/var/www/html
       - ./volumes/php/logs:/var/log/php
     environment:
+      - TZ=Asia/Shanghai
       - MYSQL_HOST=mysql
       - MYSQL_DATABASE=\${MYSQL_DB}
       - MYSQL_ROOT_PASSWORD=\${MYSQL_ROOT_PASS}
@@ -1576,6 +1635,7 @@ ${nginx_service}
     container_name: \${PROJECT_NAME}_mysql
     restart: unless-stopped
     environment:
+      - TZ=Asia/Shanghai
       - MYSQL_ROOT_PASSWORD=\${MYSQL_ROOT_PASS}
       - MYSQL_DATABASE=\${MYSQL_DB}
     volumes:
@@ -1599,9 +1659,11 @@ ${nginx_service}
     image: redis:alpine
     container_name: \${PROJECT_NAME}_redis
     restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru --requirepass \${REDIS_PASSWORD}
+    command: redis-server --appendonly yes --maxmemory \${REDIS_MAXMEMORY} --maxmemory-policy allkeys-lru --requirepass \${REDIS_PASSWORD}
     volumes:
       - ./volumes/redis:/data
+      # redis:alpine 无 tzdata，挂载宿主机时区文件使日志时间为中国时间
+      - /etc/localtime:/etc/localtime:ro
     networks:
       - default
     healthcheck:
@@ -1622,6 +1684,7 @@ ${nginx_service}
     volumes:
       - ./certbot/conf:/etc/letsencrypt
       - ./certbot/www:/var/www/certbot
+      - /etc/localtime:/etc/localtime:ro
     entrypoint: "/bin/sh -c 'trap exit TERM; while :; do sleep 6h & wait; done'"
     networks:
       - default
@@ -1647,6 +1710,13 @@ MYSQL_ROOT_PASS=$MYSQL_ROOT_PASS
 MYSQL_DB=$MYSQL_DB
 DOMAIN=$DOMAIN
 REDIS_PASSWORD=$REDIS_PASSWORD
+REDIS_MAXMEMORY=$(get_redis_maxmemory)
+BACKUP_RETENTION_DAYS=$BACKUP_RETENTION_DAYS
+NGINX_TYPE=$NGINX_TYPE
+INSTALL_PHPMYADMIN=$INSTALL_PHPMYADMIN
+CERT_TYPE=$CERT_TYPE
+DNS_PROVIDER=$DNS_PROVIDER
+SUBDOMAINS_LIST="${SUBDOMAINS[*]}"
 EOFENV
     # 安全优化: 设置 .env 文件权限为仅 root 可读
     chmod 600 "$PROJECT_DIR/.env"
@@ -2005,11 +2075,12 @@ setup_cert_renewal() {
 set -e
 cd "$(dirname "$0")"
 LOG_FILE="./cert-renewal.log"
-docker ps -a | grep certbot | awk '{print $1}' | xargs -r docker rm -f
+
 echo "[$(date)] 开始检查证书续期..." >> "$LOG_FILE"
 
 # 尝试续期证书
-if docker compose run --rm certbot renew --quiet 2>> "$LOG_FILE"; then
+# 注意: certbot 服务的 entrypoint 被改为常驻睡眠，必须用 --entrypoint 覆盖才能真正执行 renew
+if docker compose run --rm --entrypoint certbot certbot renew --quiet 2>> "$LOG_FILE"; then
     echo "[$(date)] 证书续期检查完成" >> "$LOG_FILE"
     # 只有续期成功才重载 Nginx
     if docker compose exec -T nginx nginx -t 2>> "$LOG_FILE"; then
@@ -2959,8 +3030,11 @@ cmd_cert_only() {
     else
         source "$PROJECT_DIR/.env"
         source "$PROGRESS_FILE" 2>/dev/null || true
+        # .env 里 SUBDOMAINS 以 SUBDOMAINS_LIST 标量保存，还原为数组，
+        # 否则重签证书会丢失已有子域名
+        SUBDOMAINS=(${SUBDOMAINS_LIST:-})
     fi
-    
+
     # 总是询问证书类型（用户可能想更改类型）
     select_cert_type
     
@@ -3117,7 +3191,8 @@ cmd_renew() {
     cd "$PROJECT_DIR" 2>/dev/null || error "项目目录不存在"
     
     info "检查证书续期状态..."
-    if docker compose run --rm certbot renew; then
+    # certbot 服务 entrypoint 为常驻睡眠，需用 --entrypoint 覆盖才能执行 renew
+    if docker compose run --rm --entrypoint certbot certbot renew; then
         info "测试 Nginx 配置..."
         if docker compose exec -T nginx nginx -t 2>/dev/null; then
             docker compose exec -T nginx nginx -s reload
@@ -3128,6 +3203,136 @@ cmd_renew() {
     else
         warn "证书续期失败，请检查日志"
     fi
+}
+
+# 从现有 .env 一键重新生成所有配置并重建，把时区/内存/证书续期/备份等
+# 修复应用到已运行的部署。数据库数据、SSL 证书、子域名配置、网站文件均不改动。
+cmd_reconfig() {
+    show_banner
+    step "${ICON_GEAR} 重新生成配置并应用到现有部署"
+
+    if [[ ! -f "$PROJECT_DIR/.env" ]]; then
+        error "未找到 $PROJECT_DIR/.env，请先完成初始安装"
+    fi
+
+    # 载入现有配置
+    source "$PROJECT_DIR/.env"
+
+    # 重新按当前机器内存/CPU 定档，避免以默认档位生成 PHP/MySQL 参数
+    detect_server_config
+
+    local compose_file="$PROJECT_DIR/docker-compose.yml"
+
+    # ---- 恢复迁移前老部署缺失的值 ----
+    # NGINX_TYPE / INSTALL_PHPMYADMIN 可能不在旧 .env 中
+    if [[ -z "${NGINX_TYPE:-}" || -z "${INSTALL_PHPMYADMIN:-}" ]]; then
+        # 进度文件若还在，优先使用
+        source "$PROGRESS_FILE" 2>/dev/null || true
+    fi
+
+    # NGINX_TYPE: 仍缺则从 docker-compose.yml 探测
+    if [[ -z "${NGINX_TYPE:-}" ]]; then
+        if [[ -f "$compose_file" ]] && grep -q "linuxserver/nginx" "$compose_file"; then
+            NGINX_TYPE="linuxserver"
+        elif [[ -f "$compose_file" ]] && grep -qE "image:[[:space:]]*nginx:alpine" "$compose_file"; then
+            NGINX_TYPE="standard"
+        else
+            # 含 lnmp-nginx-geoip2 或 nginx 使用 build: 均视为 official；兜底也是 official
+            NGINX_TYPE="official"
+        fi
+        info "自动探测 NGINX_TYPE=$NGINX_TYPE"
+    fi
+
+    # INSTALL_PHPMYADMIN: 仍缺则从 docker-compose.yml 探测
+    if [[ -z "${INSTALL_PHPMYADMIN:-}" ]]; then
+        if [[ -f "$compose_file" ]] && grep -q "phpmyadmin:" "$compose_file"; then
+            INSTALL_PHPMYADMIN="yes"
+        else
+            INSTALL_PHPMYADMIN="no"
+        fi
+        info "自动探测 INSTALL_PHPMYADMIN=$INSTALL_PHPMYADMIN"
+    fi
+
+    # 证书相关缺省
+    CERT_TYPE="${CERT_TYPE:-single}"
+    DNS_PROVIDER="${DNS_PROVIDER:-}"
+    # 子域名: .env 的 SUBDOMAINS_LIST 优先还原为数组；
+    # 若其为空则沿用从进度文件恢复的 SUBDOMAINS（避免清空已有子域名元数据）
+    if [[ -n "${SUBDOMAINS_LIST:-}" ]]; then
+        SUBDOMAINS=(${SUBDOMAINS_LIST})
+    fi
+
+    # ---- 展示将执行的操作并确认 ----
+    echo ""
+    echo -e "  ${BOLD}将重新生成的配置:${NC}"
+    echo -e "    ${DIM}- PHP Dockerfile / www.conf / custom.ini${NC}"
+    echo -e "    ${DIM}- MySQL custom.cnf${NC}"
+    echo -e "    ${DIM}- docker-compose.yml + .env${NC}"
+    echo -e "    ${DIM}- Nginx 主配置 (nginx.conf)${NC}"
+    echo -e "    ${DIM}- backup_task.sh / renew-cert.sh${NC}"
+    echo ""
+    echo -e "  ${BOLD}检测到的部署拓扑:${NC}"
+    echo -e "    ${DIM}├─ 服务器档位:${NC} ${CYAN}${SERVER_TIER} (${SERVER_MEM_MB}MB / ${SERVER_CPU_CORES} 核)${NC}"
+    echo -e "    ${DIM}├─ Nginx 类型:${NC} ${CYAN}${NGINX_TYPE}${NC}"
+    echo -e "    ${DIM}├─ phpMyAdmin:${NC} ${CYAN}${INSTALL_PHPMYADMIN}${NC}"
+    echo -e "    ${DIM}├─ PHP 版本:${NC}   ${CYAN}${PHP_VERSION}${NC}"
+    echo -e "    ${DIM}└─ 域名:${NC}       ${CYAN}${DOMAIN}${NC}"
+    echo ""
+    echo -e "  ${GREEN}将保留不动:${NC} 数据库数据 / SSL 证书 / 子域名与站点配置 / 网站文件"
+    if [[ "$NGINX_TYPE" == "official" ]]; then
+        echo -e "  ${YELLOW}将重建 PHP 与官方 Nginx 镜像 (应用时区)，首次可能耗时几分钟${NC}"
+    else
+        echo -e "  ${YELLOW}将重建 PHP 镜像 (应用时区)，首次可能耗时几分钟${NC}"
+    fi
+    echo ""
+    printf "${GREEN}  确认继续? [y/N]: ${NC}"
+    IFS= read -r confirm || confirm=""
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        info "操作已取消"
+        return 0
+    fi
+
+    # ---- 重新生成配置文件 (复用安装期函数，全局变量已就位) ----
+    setup_php_dockerfile
+    setup_php_ini_config
+    setup_mysql_config
+    [[ "$NGINX_TYPE" == "official" ]] && setup_nginx_dockerfile
+    setup_nginx_main_config          # 仅重写主 nginx.conf，不触碰站点/子域名配置
+    setup_docker_compose             # 重写 docker-compose.yml + .env (完成迁移值回写)
+    setup_backup                     # 重写 backup_task.sh (D 修复)，crontab 幂等
+    setup_cert_renewal               # 重写 renew-cert.sh (A 修复)，crontab 幂等
+
+    # ---- 重建镜像并重启 ----
+    step "${ICON_ROCKET} 重建镜像并重启服务"
+    cd "$PROJECT_DIR" || error "无法进入项目目录"
+
+    info "重建 PHP 镜像 (应用时区/内存配置)..."
+    docker compose build php
+
+    if [[ "$NGINX_TYPE" == "official" ]]; then
+        info "重建 Nginx 镜像 (应用时区)..."
+        docker compose build nginx
+    fi
+
+    info "重建容器 (应用时区环境变量、时区挂载、redis 内存上限等)..."
+    docker compose up -d
+
+    info "重载 Nginx 配置..."
+    docker compose exec -T nginx nginx -s reload 2>/dev/null || docker compose restart nginx
+
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}  ${ICON_OK} ${BOLD}重新配置完成！${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  ${GREEN}${ICON_OK}${NC} 数据库数据 / SSL 证书 / 子域名配置 / 网站文件均未改动"
+    echo -e "  ${GREEN}${ICON_OK}${NC} 时区、内存、证书续期、备份保留天数等修复已应用"
+    echo ""
+    echo -e "  ${DIM}提示: redis / standard-nginx / certbot 跟随宿主机时区，${NC}"
+    echo -e "  ${DIM}      建议宿主机执行: timedatectl set-timezone Asia/Shanghai${NC}"
+    echo ""
+    echo -e "  ${DIM}可运行 $0 --health 检查各服务状态${NC}"
+    echo ""
 }
 
 # ======================== 主安装流程 ========================
@@ -3145,9 +3350,23 @@ run_full_install() {
         else
             clear_progress
             STAGE=""
+            # 选择不恢复时，重置从进度文件读入的变量，确保真正从头开始
+            # (否则 DOMAIN 等仍有值，会跳过重新询问而沿用旧配置)
+            DOMAIN=""
+            SUBDOMAINS=()
+            CERT_TYPE="single"
+            DNS_PROVIDER=""
+            INSTALL_PHPMYADMIN="no"
+            NGINX_TYPE="official"
+            MYSQL_ROOT_PASS=""
+            REDIS_PASSWORD=""
         fi
     fi
     
+    # 无条件检测服务器配置: 续装时进度文件不保存档位，必须每次重新检测，
+    # 否则会以默认 medium/1024MB 生成 PHP/MySQL/Nginx 配置 (档位算错)
+    detect_server_config
+
     local stages=("env" "docker" "config" "dirs" "compose" "nginx_init" "cert" "nginx_final" "services" "backup" "done")
     local current_stage=${STAGE:-env}
     local stage_index=0
@@ -3159,7 +3378,6 @@ run_full_install() {
     # Stage: env
     if [[ $stage_index -le 0 ]]; then
         check_env
-        detect_server_config
         save_progress "docker"
     fi
     
@@ -3333,6 +3551,9 @@ main() {
             ;;
         --renew)
             cmd_renew
+            ;;
+        --reconfig)
+            cmd_reconfig
             ;;
         --status)
             cmd_status
