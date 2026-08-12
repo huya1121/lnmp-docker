@@ -10,6 +10,7 @@
 - ✅ **多 DNS 服务商** - 支持 Cloudflare、阿里云、DNSPod
 - ✅ **PHP 版本选择** - 支持 7.4, 8.0, 8.1, 8.2, 8.3, 8.4 或自定义版本
 - ✅ **Redis 集成** - 内置 Redis 缓存服务
+- ✅ **反向代理** - 支持反向代理到宿主机服务 (Node.js、Python、Go 等)
 - ✅ **断点续装** - 中断后可从上次进度继续安装
 - ✅ **自动备份** - 每日自动备份数据库和网站文件
 - ✅ **证书自动续期** - 每日检查并自动续期 SSL 证书
@@ -29,11 +30,21 @@
 
 | 组件 | 版本 | 说明 |
 |------|------|------|
-| Nginx | Alpine | 高性能 Web 服务器 |
+| Nginx | 可选 (见下方) | 高性能 Web 服务器 |
 | PHP-FPM | 7.4 - 8.4 | PHP 处理器 (可选版本) |
 | MariaDB | 10.11 | MySQL 兼容数据库 |
 | Redis | Alpine | 内存缓存数据库 |
 | Certbot | Latest | SSL 证书管理 |
+
+### Nginx 版本选择
+
+安装时可以选择三种 Nginx 类型：
+
+| 类型 | 镜像 | GeoIP2 | 说明 |
+|------|------|--------|------|
+| **官方 Nginx + GeoIP2** (推荐) | 自动构建 | ✅ 支持 | 从 nginx:alpine 自动编译 GeoIP2 模块 |
+| **LinuxServer Nginx** | linuxserver/nginx | ✅ 支持 | 预装 GeoIP2，开箱即用 |
+| **官方 Nginx 标准版** | nginx:alpine | ❌ 无 | 最小镜像，无 GeoIP2 支持 |
 
 ## 📦 PHP 扩展
 
@@ -60,7 +71,10 @@
 ├── backups/                # 备份文件目录
 ├── volumes/
 │   ├── nginx/
-│   │   └── conf.d/         # Nginx 配置文件 ⭐
+│   │   └── config/         # linuxserver/nginx 配置目录 ⭐
+│   │       └── nginx/
+│   │           ├── nginx.conf       # 主配置 (含 GeoIP2 模块)
+│   │           └── site-confs/      # 虚拟主机配置文件
 │   ├── php/
 │   │   └── www/            # 网站根目录 ⭐
 │   ├── mysql/              # MySQL 数据
@@ -75,14 +89,14 @@
 ### 1. 下载脚本
 
 ```bash
-wget https://raw.githubusercontent.com/your-repo/lnmp/deploy-lnmp.sh
-chmod +x deploy-lnmp.sh
+wget https://raw.githubusercontent.com/your-repo/lnmp/deploy-lamp.sh
+chmod +x deploy-lamp.sh
 ```
 
 ### 2. 运行部署
 
 ```bash
-sudo ./deploy-lnmp.sh
+sudo ./deploy-lamp.sh
 ```
 
 ### 3. 按提示操作
@@ -97,7 +111,7 @@ sudo ./deploy-lnmp.sh
 ## 📋 命令行参数
 
 ```bash
-./deploy-lnmp.sh [选项]
+./deploy-lamp.sh [选项]
 
 安装和部署:
   (无参数)         完整安装向导
@@ -117,8 +131,11 @@ sudo ./deploy-lnmp.sh
 
 高级操作:
   --add-subdomain  添加新子域名
+  --add-proxy      添加反向代理到宿主机服务
+  --rebuild-nginx  重新构建 Nginx 镜像 (可切换类型)
   --rebuild-php    重新构建 PHP 镜像 (可选择版本)
   --rebuild-mysql  重建 MySQL/MariaDB (可选择版本)
+  --reconfig       从现有 .env 重新生成配置并重建 (应用时区/内存/续期/备份等修复，不动数据)
   --uninstall      卸载并清理所有数据
   --upgrade        升级脚本到最新版本
   --cleanup        清理未使用的 Docker 资源
@@ -133,7 +150,7 @@ sudo ./deploy-lnmp.sh
 ### 查看服务状态
 
 ```bash
-./deploy-lnmp.sh --status
+./deploy-lamp.sh --status
 # 或
 cd ./lnmp/data && docker compose ps
 ```
@@ -141,22 +158,22 @@ cd ./lnmp/data && docker compose ps
 ### 查看日志
 
 ```bash
-./deploy-lnmp.sh --logs           # 所有服务
-./deploy-lnmp.sh --logs nginx     # Nginx 日志
-./deploy-lnmp.sh --logs php       # PHP 日志
-./deploy-lnmp.sh --logs mysql     # MySQL 日志
+./deploy-lamp.sh --logs           # 所有服务
+./deploy-lamp.sh --logs nginx     # Nginx 日志
+./deploy-lamp.sh --logs php       # PHP 日志
+./deploy-lamp.sh --logs mysql     # MySQL 日志
 ```
 
 ### 重启服务
 
 ```bash
-./deploy-lnmp.sh --restart
+./deploy-lamp.sh --restart
 ```
 
 ### 健康检查
 
 ```bash
-./deploy-lnmp.sh --health
+./deploy-lamp.sh --health
 ```
 
 输出内容包括：
@@ -167,38 +184,237 @@ cd ./lnmp/data && docker compose ps
 
 ### 数据库操作
 
+> 以下命令均在项目目录 `./lnmp` 下执行（`docker-compose.yml` 所在目录），root 密码见 `./lnmp/.credentials`。
+> MariaDB 数据库为 `mysql` 服务，容器名 `lnmp_mysql`。
+
 ```bash
-cd ./lnmp/data
-
-# 进入 MySQL 命令行
-docker compose exec mysql mysql -u root -p
-
-# 备份数据库
-docker compose exec mysql mysqldump -u root -p"密码" --all-databases > backup.sql
-
-# 恢复数据库
-docker compose exec -T mysql mysql -u root -p"密码" < backup.sql
+cd ./lnmp
 ```
+
+#### 进入数据库命令行
+
+```bash
+docker compose exec mysql mysql -u root -p
+# 直接执行单条 SQL
+docker compose exec mysql mysql -u root -p -e "SHOW DATABASES;"
+```
+
+#### 创建数据库 / 用户并授权
+
+```bash
+# 创建数据库 (utf8mb4)
+docker compose exec mysql mysql -u root -p -e \
+  "CREATE DATABASE mydb CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+
+# 创建用户并授权 (% 表示允许容器网络内任意主机连接)
+docker compose exec mysql mysql -u root -p -e \
+  "CREATE USER 'appuser'@'%' IDENTIFIED BY 'StrongPassword';
+   GRANT ALL PRIVILEGES ON mydb.* TO 'appuser'@'%';
+   FLUSH PRIVILEGES;"
+```
+
+#### 备份数据库
+
+> 自动备份已默认开启（见下方「自动任务」），此处为手动操作。
+> MariaDB 10.5+ 推荐用 `mariadb-dump`（`mysqldump` 为其别名，通常也可用）。
+
+```bash
+# 备份单个数据库
+docker compose exec mysql mariadb-dump -u root -p"密码" mydb > mydb_backup.sql
+
+# 备份全部数据库
+docker compose exec mysql mariadb-dump -u root -p"密码" --all-databases > all_backup.sql
+
+# 备份并直接压缩 (推荐大库)
+docker compose exec mysql mariadb-dump -u root -p"密码" mydb | gzip > mydb_backup.sql.gz
+
+# 使用脚本一键备份 (数据库 + 网站文件，输出到 ./lnmp/backups/)
+./deploy-lamp.sh --backup
+```
+
+#### 恢复数据库
+
+```bash
+# 从 .sql 文件恢复到指定数据库 (需先存在该库)
+docker compose exec -T mysql mysql -u root -p"密码" mydb < mydb_backup.sql
+
+# 恢复全部数据库
+docker compose exec -T mysql mysql -u root -p"密码" < all_backup.sql
+
+# 从 .gz 压缩包恢复
+gunzip < mydb_backup.sql.gz | docker compose exec -T mysql mysql -u root -p"密码" mydb
+
+# 恢复自动备份 (backups 目录下按时间命名的 db_YYYYmmdd_HHMMSS.sql)
+docker compose exec -T mysql mysql -u root -p"密码" < ./backups/db_20260812_020000.sql
+```
+
+> 注意：恢复时使用 `-T`（禁用伪 TTY），否则重定向输入会失败。
+
+#### 查看数据库列表与占用大小
+
+```bash
+# 数据库列表
+docker compose exec mysql mysql -u root -p -e "SHOW DATABASES;"
+
+# 各数据库占用大小 (MB)
+docker compose exec mysql mysql -u root -p -e \
+  "SELECT table_schema AS '数据库',
+          ROUND(SUM(data_length + index_length)/1024/1024, 2) AS '大小(MB)'
+   FROM information_schema.tables GROUP BY table_schema;"
+```
+
+#### 导入 / 导出单张表
+
+```bash
+# 导出单表
+docker compose exec mysql mariadb-dump -u root -p"密码" mydb mytable > mytable.sql
+
+# 导入单表
+docker compose exec -T mysql mysql -u root -p"密码" mydb < mytable.sql
+```
+
+### Redis 操作
+
+```bash
+cd ./lnmp
+
+# 进入 Redis 命令行 (密码见 .credentials)
+docker compose exec redis redis-cli -a "Redis密码"
+
+# 查看所有 key / 内存占用 / 清空当前库
+docker compose exec redis redis-cli -a "Redis密码" KEYS '*'
+docker compose exec redis redis-cli -a "Redis密码" INFO memory
+docker compose exec redis redis-cli -a "Redis密码" FLUSHDB
+```
+
+### 重新应用配置到现有部署 (`--reconfig`)
+
+当脚本更新了配置生成逻辑（如时区、PHP 内存、证书续期、备份保留天数等修复），已在运行的部署不会自动获得这些改动。使用 `--reconfig` 从现有 `.env` 重新生成全部配置并重建：
+
+```bash
+./deploy-lamp.sh --reconfig
+```
+
+- **会重新生成**：PHP Dockerfile / `www.conf` / `custom.ini`、MySQL `custom.cnf`、`docker-compose.yml` + `.env`、Nginx 主配置、`backup_task.sh`、`renew-cert.sh`
+- **会重建镜像**：PHP 与官方 Nginx 镜像（时区烤在镜像层内，故需重建），随后 `docker compose up -d` 重建容器
+- **不会改动**：数据库数据、SSL 证书、已添加的子域名与站点配置、网站文件
+- 执行前会展示检测到的部署拓扑并要求确认
+
+> 首次重建镜像可能耗时几分钟。redis / 标准 Nginx / certbot 容器跟随宿主机时区，建议宿主机执行 `timedatectl set-timezone Asia/Shanghai`。
 
 ### 添加新子域名
 
 ```bash
-./deploy-lnmp.sh --add-subdomain
+./deploy-lamp.sh --add-subdomain
 ```
 
 > 注意：如果使用单域名证书，添加子域名后需要重新申请证书 (`--cert`)
 
+### 反向代理到宿主机服务
+
+当您在宿主机上运行 Node.js、Python、Go 等服务时，可以使用 Nginx 反向代理将请求转发到这些服务。
+
+```bash
+./deploy-lamp.sh --add-proxy
+```
+
+脚本会引导您完成配置：
+1. 输入子域名（如 `api` 将创建 `api.example.com`）
+2. 输入宿主机服务端口（如 `3000`）
+3. 选择代理协议（HTTP/HTTPS）
+
+#### 工作原理
+
+Docker 容器默认无法直接访问宿主机的 `127.0.0.1`。脚本通过以下方式解决：
+
+1. 在 docker-compose.yml 中配置 `extra_hosts`:
+   ```yaml
+   extra_hosts:
+     - "host.docker.internal:host-gateway"
+   ```
+
+2. 生成的 Nginx 配置使用 `host.docker.internal` 访问宿主机:
+   ```nginx
+   upstream api_backend {
+       server host.docker.internal:3000;
+   }
+   ```
+
+#### 注意事项
+
+⚠️ **宿主机服务必须监听在 `0.0.0.0` 而非 `127.0.0.1`**
+
+```bash
+# ❌ 错误 - 容器无法访问
+node app.js --host 127.0.0.1 --port 3000
+
+# ✅ 正确 - 容器可以访问
+node app.js --host 0.0.0.0 --port 3000
+```
+
+常见框架配置示例：
+
+| 框架 | 正确配置 |
+|------|----------|
+| Node.js Express | `app.listen(3000, '0.0.0.0')` |
+| Python Flask | `flask run --host=0.0.0.0` |
+| Python FastAPI | `uvicorn main:app --host 0.0.0.0` |
+| Go Gin | `r.Run("0.0.0.0:3000")` |
+
+### 一键卸载
+
+```bash
+./deploy-lamp.sh --uninstall
+```
+
+**⚠️ 警告**: 此操作将彻底删除所有数据，包括：
+- 所有 Docker 容器和镜像
+- 数据库数据 (MySQL/MariaDB)
+- 网站文件
+- SSL 证书
+- 配置文件
+- 备份文件
+
+**卸载流程**：
+1. 运行 `./deploy-lamp.sh --uninstall`
+2. 输入 `yes` 确认卸载（必须输入完整的 "yes"，而非 "y"）
+3. 脚本会自动：
+   - 停止并删除所有 Docker 容器
+   - 删除 Docker 镜像和网络
+   - 移除定时任务 (crontab)
+   - 备份凭据文件到脚本所在目录
+   - 删除项目目录
+
+**卸载前建议**：
+```bash
+# 1. 先备份重要数据
+./deploy-lamp.sh --backup
+
+# 2. 导出数据库
+cd ./lnmp/data
+docker compose exec mysql mysqldump -u root -p"密码" --all-databases > /tmp/db_backup.sql
+
+# 3. 复制网站文件
+cp -r ./volumes/php/www /tmp/www_backup
+
+# 4. 保存凭据文件
+cp .credentials ~/credentials_backup.txt
+
+# 5. 执行卸载
+./deploy-lamp.sh --uninstall
+```
+
 ### SSL 证书续期
 
 ```bash
-./deploy-lnmp.sh --renew
+./deploy-lamp.sh --renew
 ```
 
 ## ⏰ 自动任务
 
 | 任务 | 执行时间 | 说明 |
 |------|----------|------|
-| 数据备份 | 每天 02:00 | 备份数据库和网站文件，保留 7 天 |
+| 数据备份 | 每天 02:00 | 备份数据库和网站文件，保留 3 天 |
 | 证书续期 | 每天 03:00 | 检查并自动续期 SSL 证书 |
 
 ## 🔐 安全说明
@@ -228,10 +444,10 @@ docker compose exec -T mysql mysql -u root -p"密码" < backup.sql
 
 ```bash
 # 查看所有服务状态
-./deploy-lnmp.sh --status
+./deploy-lamp.sh --status
 
 # 查看详细日志
-./deploy-lnmp.sh --logs
+./deploy-lamp.sh --logs
 
 # 检查端口占用
 netstat -tlnp | grep -E '80|443'
@@ -284,7 +500,7 @@ docker compose exec mysql mysql -u root -p -e "SELECT 1"
 如果安装中断，重新运行脚本会自动检测进度并询问是否继续：
 
 ```bash
-./deploy-lnmp.sh
+./deploy-lamp.sh
 # 检测到未完成的安装 (阶段: xxx)
 # 是否继续上次安装? [Y/n]:
 ```
@@ -297,7 +513,38 @@ rm ./lnmp/data/.install_progress
 
 ## 📝 更新日志
 
-### v2.2.0 (当前版本)
+### v2.6.0 (当前版本)
+- 🆕 **一键重新配置**: 新增 `--reconfig` 命令，从现有 `.env` 重新生成全部配置并重建，把时区/内存/续期/备份等修复应用到已运行的部署，不影响数据、证书、子域名配置
+- 🆕 **配置持久化**: `NGINX_TYPE` / `INSTALL_PHPMYADMIN` / `CERT_TYPE` / `DNS_PROVIDER` / 子域名列表迁移进 `.env`（此前装完即丢）；`--reconfig` 对旧部署自动探测补齐
+- 🕐 **全容器中国时区**: PHP / 官方 Nginx 镜像内置 tzdata 并设为 `Asia/Shanghai`，各服务补充 `TZ` 环境变量，redis / 标准 Nginx / certbot 挂载宿主机时区文件；MySQL 设 `default-time-zone = '+08:00'`
+- 🧠 **PHP 内存保护**: `pm.max_children` 改为按可用内存动态计算，避免进程数 × `memory_limit` 撑爆内存；新增 `request_terminate_timeout` 回收卡死请求
+- 🐛 修复证书自动续期：certbot 常驻 entrypoint 导致 `renew` 从未真正执行，改用 `--entrypoint certbot` 覆盖
+- 🆕 **反向代理支持**: 新增 `--add-proxy` 命令，支持反向代理到宿主机服务
+- 🆕 **Nginx 重建命令**: 新增 `--rebuild-nginx` 命令，支持重新构建或切换 Nginx 类型
+- 🆕 **host.docker.internal**: 自动配置 `extra_hosts`，容器可通过 `host.docker.internal` 访问宿主机
+- 🔧 支持代理到 Node.js、Python、Go 等宿主机上运行的服务
+- 🔧 自动生成包含 WebSocket 支持的 Nginx 反向代理配置
+
+### v2.5.0
+- 🆕 **多 Nginx 类型支持**: 安装时可选择三种 Nginx 配置
+  - 官方 Nginx + GeoIP2 (推荐): 自动编译 ngx_http_geoip2_module
+  - LinuxServer Nginx: 预装 GeoIP2，开箱即用
+  - 官方 Nginx 标准版: 最小镜像，无 GeoIP2
+- 🆕 **GeoIP2 自动编译**: 官方 nginx 模式使用多阶段 Docker 构建
+- 🔧 根据 Nginx 类型自动适配目录结构和配置
+
+### v2.4.0
+- 🆕 **Nginx 镜像更换**: 从 `nginx:alpine` 切换到 `linuxserver/nginx`
+- 🆕 **GeoIP2 支持**: linuxserver/nginx 预装 GeoIP2 模块
+- 🔧 更新目录结构适配 linuxserver/nginx
+
+### v2.3.0
+- 🔒 **安全修复**: Redis 添加密码认证，修复安全警告 "Redis 没有要求身份验证且不受网络限制保护"
+- 🔧 Redis 密码自动生成并保存至 `.credentials` 文件
+- 🔧 PHP 环境变量中添加 `REDIS_PASSWORD`，支持应用程序安全连接 Redis
+- 🔧 更新示例 `index.php`，演示带认证的 Redis 连接
+
+### v2.2.0
 - 🔧 修复备份脚本中 `which` 命令可能不存在的问题，改用 POSIX 兼容的 `command -v`
 - 🔧 改进 Nginx 启动验证：添加最多 30 秒的等待循环，替代固定 5 秒延时
 - 🔧 修复 Docker 网络检测竞态条件：增加等待时间和多种网络名称获取方式
