@@ -1605,6 +1605,7 @@ ${nginx_service}
       args:
         PHP_VERSION: \${PHP_VERSION}
     image: lnmp-php:\${PHP_VERSION}
+    pull_policy: build
     container_name: \${PROJECT_NAME}_php
     restart: unless-stopped
     volumes:
