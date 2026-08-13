@@ -1470,7 +1470,7 @@ _generate_docker_compose_nginx() {
     networks:
       - default
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1508,7 +1508,7 @@ EOFNGINXSVC
     networks:
       - default
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1546,7 +1546,7 @@ EOFNGINXSVC
     networks:
       - default
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1748,8 +1748,12 @@ setup_nginx_initial() {
     cat > "$nginx_conf_dir/00-http-redirect.conf" << 'EOFNGINX'
 server {
     listen 80 default_server;
+    # 同时作为 IPv6 默认 server：容器内 localhost 常解析为 ::1，
+    # 若此处不监听 [::]:80，健康检查/重定向请求会落到其它带 listen [::]:80
+    # 的站点 server 而被 301 到 https，导致探测失败。
+    listen [::]:80 default_server;
     server_name _;
-    
+
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
