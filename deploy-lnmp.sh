@@ -2,8 +2,8 @@
 set -eo pipefail
 
 # ======================== 版本和配置 ========================
-VERSION="2.6.0"
-SCRIPT_URL="https://raw.githubusercontent.com/your-repo/lnmp-docker/main/deploy-lamp.sh"
+VERSION="2.6.1"
+SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy-lamp.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
 PROJECT_NAME="lnmp"
@@ -1470,7 +1470,7 @@ _generate_docker_compose_nginx() {
     networks:
       - default
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1508,7 +1508,7 @@ EOFNGINXSVC
     networks:
       - default
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1546,7 +1546,7 @@ EOFNGINXSVC
     networks:
       - default
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1753,7 +1753,15 @@ server {
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
-    
+
+    # 健康检查专用端点: 纯 HTTP 返回 200, 不跳转 https。
+    # 避免容器健康检查的 busybox wget (默认不支持 SSL) 跟随 301 到 https 而失败。
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+
     location / {
         return 301 https://$host$request_uri;
     }
@@ -3307,6 +3315,7 @@ cmd_reconfig() {
     setup_mysql_config
     [[ "$NGINX_TYPE" == "official" ]] && setup_nginx_dockerfile
     setup_nginx_main_config          # 仅重写主 nginx.conf，不触碰站点/子域名配置
+    setup_nginx_initial              # 重写 00-http-redirect.conf (补 /healthz 健康检查端点)，不触碰站点/子域名配置
     setup_docker_compose             # 重写 docker-compose.yml + .env (完成迁移值回写)
     setup_backup                     # 重写 backup_task.sh (D 修复)，crontab 幂等
     setup_cert_renewal               # 重写 renew-cert.sh (A 修复)，crontab 幂等
