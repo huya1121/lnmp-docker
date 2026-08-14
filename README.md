@@ -2,7 +2,7 @@
 # LNMP Docker 自动化部署脚本
 
 一键部署 LNMP (Linux + Nginx + MySQL + PHP + Redis) 环境，支持 Let's Encrypt SSL 证书（单域名/通配符）、自动备份、断点续装等功能。
-(chown -R 82:82 volumes/php/www Alpine 版官方 PHP 镜像里的 www-data 用户 UID/GID 是 82，不是 Debian 系里常见的 33，这个要修改不然很多程序无法保存配置。)
+(chown -R 82:82 lnmp/volumes/php/www Alpine 版官方 PHP 镜像里的 www-data 用户 UID/GID 是 82，不是 Debian 系里常见的 33，这个要修改不然很多程序无法保存配置。)
 
 ## 🚀 功能特点
 
