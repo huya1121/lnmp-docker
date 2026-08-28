@@ -2,7 +2,6 @@
 # LNMP Docker 自动化部署脚本
 
 一键部署 LNMP (Linux + Nginx + MySQL + PHP + Redis) 环境，支持 Let's Encrypt SSL 证书（单域名/通配符）、自动备份、断点续装等功能。
-(chown -R 82:82 lnmp/volumes/php/www Alpine 版官方 PHP 镜像里的 www-data 用户 UID/GID 是 82，不是 Debian 系里常见的 33，这个要修改不然很多程序无法保存配置。)
 
 ## 🚀 功能特点
 
@@ -90,7 +89,8 @@
 ### 1. 下载脚本
 
 ```bash
-wget https://raw.githubusercontent.com/your-repo/lnmp/deploy-lamp.sh
+# 从 GitHub 下载 (仓库文件名为 deploy-lnmp.sh，本地另存为 deploy-lamp.sh)
+wget -O deploy-lamp.sh https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy-lnmp.sh
 chmod +x deploy-lamp.sh
 ```
 
@@ -136,6 +136,7 @@ sudo ./deploy-lamp.sh
   --rebuild-nginx  重新构建 Nginx 镜像 (可切换类型)
   --rebuild-php    重新构建 PHP 镜像 (可选择版本)
   --rebuild-mysql  重建 MySQL/MariaDB (可选择版本)
+  --reset-mysql-password  重置 MySQL/MariaDB root 密码 (不影响数据)
   --reconfig       从现有 .env 重新生成配置并重建 (应用时区/内存/续期/备份等修复，不动数据)
   --uninstall      卸载并清理所有数据
   --upgrade        升级脚本到最新版本
@@ -273,6 +274,23 @@ docker compose exec mysql mariadb-dump -u root -p"密码" mydb mytable > mytable
 # 导入单表
 docker compose exec -T mysql mysql -u root -p"密码" mydb < mytable.sql
 ```
+
+#### 忘记 / 重置 root 密码
+
+当 `.credentials` 里的密码失效或忘记时，用脚本一键重置（**不影响任何数据**）：
+
+```bash
+./deploy-lamp.sh --reset-mysql-password
+```
+
+脚本会：
+1. 先检测当前密码是否仍可用（可用则可选择放弃）
+2. 让你选择自动生成新密码或手动输入
+3. 用 `--skip-grant-tables` 临时容器（复用现有数据卷）修改 `root` 密码
+4. 自动把新密码同步写回 `.env` 与 `.credentials`
+5. 重启 MySQL 并验证新密码
+
+> 提示：手动输入密码时建议使用纯字母数字，避免 `$`、反引号、引号等特殊字符导致 `.env` / SQL 解析异常。
 
 ### Redis 操作
 
@@ -541,7 +559,23 @@ rm ./lnmp/data/.install_progress
 
 ## 📝 更新日志
 
-### v2.6.0 (当前版本)
+### v2.7.1 (当前版本)
+- 🐛 **修复 MySQL 8.0 健康检查**: 健康检查里的 `$$MYSQL_ROOT_PASSWORD` 在未加引号的 heredoc 中被 shell 吃成进程号，导致 `mysql:8.0` 镜像永远 unhealthy、`php` 无法启动；改用 `\$\$` 正确转义
+- 🐛 **修复自动更新失效**: `version_compare` 裸调用在 `set -e` 下版本不同即退出，`--upgrade` 只打印版本从不真正升级；改用 `|| cmp_result=$?` 兜住
+- 🐛 **修复系统检测污染版本号**: `source /etc/os-release` 会用系统的 `VERSION=` 覆盖脚本全局 `VERSION`；改为子 shell 读取
+- 🐛 **修复进度文件密码损坏**: 含空格/`$`/引号的密码写入 `.install_progress` 未加引号会被截断；改用 `printf %q` 安全序列化
+- 🐛 **修复 rebuild-php 失败分支不可达**: `set -e` 下构建失败会直接退出，失败分支永远走不到；改用 `if` 直接判定退出码
+- 🔧 **子域名/反代加固**: 配置序号改用最大数字前缀 +1（避免删除产生空洞后撞名覆盖）；新增重复域名检测；`--add-subdomain` reload 前先 `nginx -t` 校验、失败自动回滚
+- 🔧 **重置密码健壮性**: 临时容器启动失败时自动恢复正常 MySQL；成功提示如实说明 `root@'%'` 未做网络验证
+- 🔧 **cmd_cert_only 修复**: 与 `--reconfig` 对齐，`SUBDOMAINS_LIST` 为空时不再清空已有子域名
+
+### v2.7.0
+- 🆕 **重置 MySQL 密码**: 新增 `--reset-mysql-password` 命令，用 `skip-grant-tables` 临时容器重置 root 密码，自动同步回 `.env` / `.credentials`，全程不影响数据
+- 📖 **README 扩充**: 生成的项目 `README.md` 补全常用管理命令（脚本封装 / Docker Compose / 数据库 / Redis 操作）
+- 🔧 **自更新地址修正**: `SCRIPT_URL` 指向真实仓库 `huya1121/lnmp-docker`，`--upgrade` 现可正常拉取最新版
+- 🐛 **自更新安全性**: 升级时临时文件改到脚本同目录，避免跨文件系统 `mv` 破坏正在运行的脚本
+
+### v2.6.0
 - 🆕 **一键重新配置**: 新增 `--reconfig` 命令，从现有 `.env` 重新生成全部配置并重建，把时区/内存/续期/备份等修复应用到已运行的部署，不影响数据、证书、子域名配置
 - 🆕 **配置持久化**: `NGINX_TYPE` / `INSTALL_PHPMYADMIN` / `CERT_TYPE` / `DNS_PROVIDER` / 子域名列表迁移进 `.env`（此前装完即丢）；`--reconfig` 对旧部署自动探测补齐
 - 🕐 **全容器中国时区**: PHP / 官方 Nginx 镜像内置 tzdata 并设为 `Asia/Shanghai`，各服务补充 `TZ` 环境变量，redis / 标准 Nginx / certbot 挂载宿主机时区文件；MySQL 设 `default-time-zone = '+08:00'`
