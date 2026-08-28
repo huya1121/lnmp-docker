@@ -2,7 +2,7 @@
 set -eo pipefail
 
 # ======================== 版本和配置 ========================
-VERSION="2.7.0"
+VERSION="2.7.1"
 SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy-lnmp.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
@@ -382,18 +382,20 @@ save_progress() {
     for sub in "${SUBDOMAINS[@]}"; do
         subdomains_str+="\"$sub\" "
     done
-    cat > "$PROGRESS_FILE" << EOFPROG
-STAGE=$stage
-DOMAIN=$DOMAIN
-CERT_TYPE=$CERT_TYPE
-DNS_PROVIDER=$DNS_PROVIDER
-MYSQL_ROOT_PASS=$MYSQL_ROOT_PASS
-REDIS_PASSWORD=$REDIS_PASSWORD
-PHP_VERSION=$PHP_VERSION
-INSTALL_PHPMYADMIN=$INSTALL_PHPMYADMIN
-NGINX_TYPE=$NGINX_TYPE
-SUBDOMAINS=(${subdomains_str})
-EOFPROG
+    # 密码可能含空格/$/#/引号等特殊字符，用 printf %q 生成可被 source 安全还原的转义形式，
+    # 避免写入时被截断、恢复进度时读到错误密码
+    {
+        echo "STAGE=$stage"
+        echo "DOMAIN=$DOMAIN"
+        echo "CERT_TYPE=$CERT_TYPE"
+        echo "DNS_PROVIDER=$DNS_PROVIDER"
+        printf 'MYSQL_ROOT_PASS=%q\n' "$MYSQL_ROOT_PASS"
+        printf 'REDIS_PASSWORD=%q\n' "$REDIS_PASSWORD"
+        echo "PHP_VERSION=$PHP_VERSION"
+        echo "INSTALL_PHPMYADMIN=$INSTALL_PHPMYADMIN"
+        echo "NGINX_TYPE=$NGINX_TYPE"
+        echo "SUBDOMAINS=(${subdomains_str})"
+    } > "$PROGRESS_FILE"
     # 进度文件含数据库/Redis 密码，限制为仅 root 可读
     chmod 600 "$PROGRESS_FILE" 2>/dev/null || true
 }
@@ -528,9 +530,13 @@ check_env() {
     
     # 检查操作系统
     if [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        info "操作系统: $NAME $VERSION_ID"
-        case "$ID" in
+        # 在子 shell 中读取，避免 /etc/os-release 里的 VERSION= 覆盖脚本全局 VERSION
+        local os_name os_id os_version_id
+        os_name=$(. /etc/os-release 2>/dev/null; printf '%s' "$NAME")
+        os_id=$(. /etc/os-release 2>/dev/null; printf '%s' "$ID")
+        os_version_id=$(. /etc/os-release 2>/dev/null; printf '%s' "$VERSION_ID")
+        info "操作系统: $os_name $os_version_id"
+        case "$os_id" in
             debian|ubuntu)
                 ;;
             centos|rhel|fedora|rocky|almalinux)
@@ -1651,7 +1657,7 @@ ${nginx_service}
     networks:
       - default
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD 2>/dev/null || mariadb-admin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD 2>/dev/null || healthcheck.sh --connect 2>/dev/null"]
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p\$\$MYSQL_ROOT_PASSWORD 2>/dev/null || mariadb-admin ping -h localhost -uroot -p\$\$MYSQL_ROOT_PASSWORD 2>/dev/null || healthcheck.sh --connect 2>/dev/null"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -2521,12 +2527,23 @@ cmd_add_subdomain() {
         nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
     fi
     
+    # 重复检测: 避免同一子域名被添加两次产生冲突的 server_name
+    if grep -rqsE "server_name[[:space:]]+${new_sub}\.${DOMAIN};" "$nginx_conf_dir/" 2>/dev/null; then
+        error "子域名 ${new_sub}.${DOMAIN} 已存在配置，请勿重复添加"
+    fi
+
     local ssl_cert="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
     local ssl_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-    local config_num=$(ls -1 "$nginx_conf_dir/" 2>/dev/null | wc -l)
-    config_num=$((config_num + 1))
-    
-    cat > "$nginx_conf_dir/0${config_num}-${new_sub}.conf" << EOFNEWSUB
+    # 取现有配置文件的最大数字前缀 +1，避免用文件总数推算时因删除产生空洞而撞名覆盖
+    local existing_max
+    existing_max=$(ls -1 "$nginx_conf_dir/" 2>/dev/null | grep -oE '^[0-9]+' | sort -n | tail -1)
+    existing_max=${existing_max:-0}
+    local config_num=$(( 10#$existing_max + 1 ))
+    local config_prefix
+    config_prefix=$(printf '%02d' "$config_num")
+    local new_conf="$nginx_conf_dir/${config_prefix}-${new_sub}.conf"
+
+    cat > "$new_conf" << EOFNEWSUB
 server {
     listen 443 ssl;
     http2 on;
@@ -2565,10 +2582,15 @@ EOFNEWSUB
 </head><body><div><h1>🚀 ${new_sub}.${DOMAIN}</h1><p>New subdomain ready!</p></div></body></html>
 EOFHTML
 
-    # 重载 Nginx
+    # 重载 Nginx: 先测试配置，失败则回滚新增的配置文件，避免坏配置留在盘上
     cd "$PROJECT_DIR"
-    docker compose exec nginx nginx -s reload
-    
+    if docker compose exec -T nginx nginx -t >/dev/null 2>&1; then
+        docker compose exec -T nginx nginx -s reload
+    else
+        rm -f "$new_conf"
+        error "Nginx 配置测试失败，已回滚新增的子域名配置"
+    fi
+
     log "子域名 ${new_sub}.${DOMAIN} 添加成功"
     info "网站目录: $sub_dir"
     warn "如果使用单域名证书，需要重新申请证书以包含新子域名"
@@ -2618,12 +2640,23 @@ cmd_add_proxy() {
         nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
     fi
     
+    # 重复检测: 避免同一子域名反代被添加两次
+    if grep -rqsE "server_name[[:space:]]+${proxy_sub}\.${DOMAIN};" "$nginx_conf_dir/" 2>/dev/null; then
+        error "子域名 ${proxy_sub}.${DOMAIN} 已存在配置，请勿重复添加"
+    fi
+
     local ssl_cert="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
     local ssl_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-    local config_num=$(ls -1 "$nginx_conf_dir/" 2>/dev/null | wc -l)
-    config_num=$((config_num + 1))
-    
-    cat > "$nginx_conf_dir/0${config_num}-proxy-${proxy_sub}.conf" << EOFPROXY
+    # 取现有配置文件的最大数字前缀 +1，避免用文件总数推算导致撞名覆盖
+    local existing_max
+    existing_max=$(ls -1 "$nginx_conf_dir/" 2>/dev/null | grep -oE '^[0-9]+' | sort -n | tail -1)
+    existing_max=${existing_max:-0}
+    local config_num=$(( 10#$existing_max + 1 ))
+    local config_prefix
+    config_prefix=$(printf '%02d' "$config_num")
+    local new_conf="$nginx_conf_dir/${config_prefix}-proxy-${proxy_sub}.conf"
+
+    cat > "$new_conf" << EOFPROXY
 # 反向代理: ${proxy_sub}.${DOMAIN} -> host.docker.internal:${host_port}
 upstream ${proxy_sub}_backend {
     server host.docker.internal:${host_port};
@@ -2672,15 +2705,16 @@ EOFPROXY
         docker compose exec -T nginx nginx -s reload
         log "反向代理配置成功: ${proxy_sub}.${DOMAIN} -> host:${host_port}"
     else
-        warn "Nginx 配置测试失败，请检查配置文件"
-        docker compose exec -T nginx nginx -t
+        rm -f "$new_conf"
+        docker compose exec -T nginx nginx -t || true
+        error "Nginx 配置测试失败，已回滚新增的反向代理配置"
     fi
     
     echo ""
     echo -e "  ${BOLD}配置详情:${NC}"
     echo -e "    访问地址: https://${proxy_sub}.${DOMAIN}"
     echo -e "    代理目标: ${upstream_proto}://host.docker.internal:${host_port}"
-    echo -e "    配置文件: $nginx_conf_dir/0${config_num}-proxy-${proxy_sub}.conf"
+    echo -e "    配置文件: $new_conf"
     echo ""
     warn "请确保宿主机服务监听在 0.0.0.0:${host_port} 而非 127.0.0.1:${host_port}"
     info "如使用通配符证书，代理将立即生效；否则需重新申请证书"
@@ -2871,15 +2905,16 @@ cmd_rebuild_php() {
     info "构建新的 PHP 镜像 (版本: $PHP_VERSION)..."
     echo ""
     
+    # 注意: set -e 下，构建命令若失败会直接终止脚本，故用 if 直接判定其退出码，
+    # 否则下面的失败分支 (error "PHP 镜像构建失败") 永远走不到
+    local build_ok=0
     if [[ "$build_type" == "1" ]]; then
-        docker compose build php
+        docker compose build php || build_ok=1
     else
-        docker compose build --no-cache php
+        docker compose build --no-cache php || build_ok=1
     fi
-    
-    local build_status=$?
-    
-    if [[ $build_status -eq 0 ]]; then
+
+    if [[ $build_ok -eq 0 ]]; then
         info "启动 PHP 容器..."
         docker compose up -d php
         
@@ -3117,8 +3152,13 @@ cmd_reset_mysql_password() {
 
     # 4) 以 skip-grant-tables 模式启动临时容器 (复用同一数据卷)
     info "以 skip-grant-tables 模式启动临时容器..."
-    docker compose run --no-deps -d --name "$reset_container" mysql \
-        --skip-grant-tables --skip-networking >/dev/null
+    # 临时容器启动失败时，正常 mysql 已被 stop，需恢复启动后再报错，避免服务停摆
+    if ! docker compose run --no-deps -d --name "$reset_container" mysql \
+        --skip-grant-tables --skip-networking >/dev/null; then
+        docker rm -f "$reset_container" 2>/dev/null || true
+        docker compose up -d mysql
+        error "临时容器启动失败，已恢复正常 MySQL 容器，请查看日志: docker compose logs mysql"
+    fi
 
     # 5) 等待临时数据库就绪
     info "等待临时数据库就绪..."
@@ -3180,10 +3220,13 @@ cmd_reset_mysql_password() {
     echo ""
 
     if docker compose exec -T mysql sh -c "mariadb -uroot -p'$new_pass' -e 'SELECT 1' 2>/dev/null || mysql -uroot -p'$new_pass' -e 'SELECT 1' 2>/dev/null" >/dev/null 2>&1; then
-        log "root 密码重置成功！"
+        log "root 密码重置成功！(已验证 root@localhost)"
         echo ""
         echo -e "  ${BOLD}新的 root 密码:${NC} ${GREEN}$new_pass${NC}"
         echo -e "  ${DIM}已同步到: $PROJECT_DIR/.env 和 $CREDENTIALS_FILE${NC}"
+        echo ""
+        echo -e "  ${DIM}注: 已尽力重置 root@'%' (供容器网络内远程连接)，但该账户仅在存在时才生效、且未做网络验证。${NC}"
+        echo -e "  ${DIM}    若应用 (如 PHP 容器) 以 root 跨网络连接仍失败，请检查 root@'%' 账户是否存在。${NC}"
         echo ""
         echo -e "  ${YELLOW}${ICON_WARN} 请记得同步更新你的应用程序数据库连接密码！${NC}"
     else
@@ -3243,9 +3286,12 @@ cmd_cert_only() {
     else
         source "$PROJECT_DIR/.env"
         source "$PROGRESS_FILE" 2>/dev/null || true
-        # .env 里 SUBDOMAINS 以 SUBDOMAINS_LIST 标量保存，还原为数组，
-        # 否则重签证书会丢失已有子域名
-        SUBDOMAINS=(${SUBDOMAINS_LIST:-})
+        # .env 里 SUBDOMAINS 以 SUBDOMAINS_LIST 标量保存，还原为数组；
+        # 仅当 SUBDOMAINS_LIST 非空时才覆盖，否则沿用进度文件恢复的 SUBDOMAINS，
+        # 避免 .env 缺该值时清空已有子域名导致重签证书丢子域名
+        if [[ -n "${SUBDOMAINS_LIST:-}" ]]; then
+            SUBDOMAINS=(${SUBDOMAINS_LIST})
+        fi
     fi
 
     # 总是询问证书类型（用户可能想更改类型）
@@ -3316,8 +3362,10 @@ cmd_upgrade() {
             return 0
         }
         
-        version_compare "$VERSION" "$remote_version"
-        local cmp_result=$?
+        # 注意: version_compare 相等返回 0、否则返回 1/2。在 set -e 下裸调用非零会直接退出，
+        # 必须用 || true 兜住，否则"发现新版本"的升级分支永远走不到。
+        local cmp_result=0
+        version_compare "$VERSION" "$remote_version" || cmp_result=$?
         
         if [[ $cmp_result -eq 0 ]]; then
             log "您已经在使用最新版本"
