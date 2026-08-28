@@ -2,8 +2,8 @@
 set -eo pipefail
 
 # ======================== 版本和配置 ========================
-VERSION="2.6.1"
-SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/refs/heads/main/deploy-lnmp.sh"
+VERSION="2.7.0"
+SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy-lnmp.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
 PROJECT_NAME="lnmp"
@@ -444,6 +444,7 @@ show_help() {
     echo -e "  ${CYAN}--rebuild-nginx${NC}  重新构建 Nginx 镜像 (可切换类型)"
     echo -e "  ${CYAN}--rebuild-php${NC}    重新构建 PHP 镜像 (可选择版本)"
     echo -e "  ${CYAN}--rebuild-mysql${NC}  重建 MySQL/MariaDB (可选择版本)"
+    echo -e "  ${CYAN}--reset-mysql-password${NC}  重置 MySQL/MariaDB root 密码 (不影响数据)"
     echo -e "  ${CYAN}--reconfig${NC}       从现有 .env 重新生成配置并重建 (应用时区/内存/续期/备份等修复，不动数据)"
     echo -e "  ${CYAN}--uninstall${NC}      卸载并清理所有数据"
     echo -e "  ${CYAN}--upgrade${NC}        升级脚本到最新版本"
@@ -1605,7 +1606,6 @@ ${nginx_service}
       args:
         PHP_VERSION: \${PHP_VERSION}
     image: lnmp-php:\${PHP_VERSION}
-    pull_policy: build
     container_name: \${PROJECT_NAME}_php
     restart: unless-stopped
     volumes:
@@ -2279,22 +2279,78 @@ $PROJECT_DIR/
 └── backups/             # 备份文件
 \`\`\`
 
-## 常用命令
+## 常用管理命令 (脚本封装)
+> 下面的 \`$0\` 即本部署脚本 (通常是 \`$PROJECT_DIR/deploy.sh\`)
 \`\`\`bash
-# 查看状态
-$0 --status
+# ---- 服务管理 ----
+$0 --status                # 查看所有服务运行状态
+$0 --restart               # 重启所有服务
+$0 --stop                  # 停止所有服务
+$0 --logs                  # 查看全部日志 (实时)
+$0 --logs nginx            # 查看指定服务日志 (nginx/php/mysql/redis)
+$0 --health                # 健康检查
+$0 --info                  # 显示当前配置信息
 
-# 重启服务
-$0 --restart
+# ---- 备份 / 证书 ----
+$0 --backup                # 立即执行一次备份
+$0 --renew                 # 续期已有 SSL 证书
+$0 --cert                  # 单独申请 / 重新申请 SSL 证书
 
-# 查看日志
-$0 --logs nginx
+# ---- 域名 / 代理 ----
+$0 --add-subdomain         # 添加新子域名
+$0 --add-proxy             # 添加反向代理到宿主机服务
 
-# 手动备份
-$0 --backup
+# ---- 重建 / 维护 ----
+$0 --rebuild-nginx         # 重建 Nginx 镜像 (可切换类型)
+$0 --rebuild-php           # 重建 PHP 镜像 (可选择版本)
+$0 --rebuild-mysql         # 重建 MySQL/MariaDB (可选择版本, 不删数据)
+$0 --reset-mysql-password  # 重置 MySQL/MariaDB root 密码 (不影响数据)
+$0 --reconfig              # 从 .env 重新生成配置并重建 (不动数据)
+$0 --cleanup               # 清理未使用的 Docker 资源
+$0 --upgrade               # 升级脚本自身到最新版本
+\`\`\`
 
-# 续期证书
-$0 --renew
+## Docker Compose 常用命令
+> 需先进入项目目录: \`cd $PROJECT_DIR\`
+\`\`\`bash
+docker compose ps                        # 查看容器状态
+docker compose up -d                     # 启动 / 更新所有服务
+docker compose down                      # 停止并移除容器 (数据卷保留)
+docker compose restart mysql             # 重启单个服务
+docker compose logs -f --tail=100 php    # 跟踪某个服务的日志
+docker compose exec php sh               # 进入 PHP 容器 shell
+\`\`\`
+
+## 数据库操作 (MySQL / MariaDB)
+> root 密码见 \`.credentials\` 文件。若使用的是 MySQL 8.0 镜像, 请把下列 \`mariadb\` / \`mariadb-dump\` 换成 \`mysql\` / \`mysqldump\`。
+\`\`\`bash
+# 进入数据库命令行 (回车后输入 root 密码)
+docker compose exec mysql mariadb -uroot -p
+
+# 创建数据库
+docker compose exec mysql mariadb -uroot -p -e "CREATE DATABASE dbname CHARACTER SET utf8mb4;"
+
+# 创建用户并授权
+docker compose exec mysql mariadb -uroot -p -e "CREATE USER 'user'@'%' IDENTIFIED BY 'password'; GRANT ALL ON dbname.* TO 'user'@'%'; FLUSH PRIVILEGES;"
+
+# 查看所有数据库
+docker compose exec mysql mariadb -uroot -p -e "SHOW DATABASES;"
+
+# 备份 / 恢复数据库
+docker compose exec mysql mariadb-dump -uroot -p dbname > backup.sql
+docker compose exec -T mysql mariadb -uroot -p dbname < backup.sql
+
+# 忘记 / 需要重置 root 密码 (不影响数据):
+$0 --reset-mysql-password
+\`\`\`
+
+## Redis 操作
+> 密码见 \`.credentials\` 文件, 把下面的 '你的Redis密码' 替换为实际密码
+\`\`\`bash
+docker compose exec redis redis-cli -a '你的Redis密码'             # 进入 Redis
+docker compose exec redis redis-cli -a '你的Redis密码' KEYS '*'    # 查看所有 key
+docker compose exec redis redis-cli -a '你的Redis密码' FLUSHALL    # 清空缓存
+docker compose exec redis redis-cli -a '你的Redis密码' INFO memory # 查看内存使用
 \`\`\`
 
 ## 网站目录
@@ -3000,6 +3056,141 @@ cmd_rebuild_mysql() {
     fi
 }
 
+# 重置 MySQL/MariaDB root 密码 (使用 skip-grant-tables, 不影响数据)
+cmd_reset_mysql_password() {
+    step "${ICON_LOCK} 重置 MySQL/MariaDB root 密码"
+
+    if [[ ! -f "$PROJECT_DIR/.env" ]]; then
+        error "未找到 .env，请先完成初始安装"
+    fi
+    source "$PROJECT_DIR/.env"
+    cd "$PROJECT_DIR" 2>/dev/null || error "项目目录不存在"
+
+    local reset_container="${PROJECT_NAME}_mysql_reset"
+
+    echo ""
+    echo -e "  ${DIM}数据保存在持久化卷中，此操作仅重置 root 密码，${NC}${BOLD}不会影响数据库数据${NC}${DIM}。${NC}"
+
+    # 1) 先检测当前记录的密码是否其实可用 (可能只是应用端配错了)
+    if [[ -n "${MYSQL_ROOT_PASS:-}" ]] && docker compose ps mysql 2>/dev/null | grep -q "Up"; then
+        if docker compose exec -T mysql sh -c "mariadb -uroot -p'$MYSQL_ROOT_PASS' -e 'SELECT 1' 2>/dev/null || mysql -uroot -p'$MYSQL_ROOT_PASS' -e 'SELECT 1' 2>/dev/null" >/dev/null 2>&1; then
+            echo ""
+            warn ".env 中记录的 root 密码其实是可用的！"
+            echo -e "  ${DIM}很可能是你的应用/连接工具里的密码写错了，而不是数据库密码丢失。${NC}"
+            echo -e "  ${DIM}当前有效密码见: $CREDENTIALS_FILE${NC}"
+            echo ""
+            printf "${YELLOW}  仍要强制重置为新密码吗? [y/N]: ${NC}"
+            IFS= read -r force_confirm || force_confirm=""
+            [[ "$force_confirm" =~ ^[Yy]$ ]] || { info "操作已取消"; return 0; }
+        fi
+    fi
+
+    # 2) 确定新密码
+    local new_pass=""
+    echo ""
+    echo -e "  ${CYAN}1)${NC} 自动生成强密码 ${GREEN}(推荐)${NC}"
+    echo -e "  ${CYAN}2)${NC} 手动输入新密码"
+    echo -e "  ${CYAN}0)${NC} 取消"
+    echo ""
+    printf "${GREEN}  请选择 [0-2]: ${NC}"
+    IFS= read -r pass_choice || pass_choice=""
+    case "$pass_choice" in
+        1|"") new_pass=$(generate_strong_password) ;;
+        2)
+            printf "${GREEN}  请输入新密码 (建议仅字母和数字, >=12 位): ${NC}"
+            IFS= read -r new_pass || new_pass=""
+            [[ -n "$new_pass" ]] || error "密码不能为空"
+            if [[ "$new_pass" =~ [^a-zA-Z0-9] ]]; then
+                warn "检测到特殊字符，为避免转义问题，建议仅使用字母和数字"
+                printf "${YELLOW}  仍要继续? [y/N]: ${NC}"
+                IFS= read -r sp_confirm || sp_confirm=""
+                [[ "$sp_confirm" =~ ^[Yy]$ ]] || { info "操作已取消"; return 0; }
+            fi
+            ;;
+        *) info "操作已取消"; return 0 ;;
+    esac
+
+    # 3) 停止正常容器，清理可能残留的临时容器
+    info "停止 MySQL 容器..."
+    docker compose stop mysql
+    docker rm -f "$reset_container" 2>/dev/null || true
+
+    # 4) 以 skip-grant-tables 模式启动临时容器 (复用同一数据卷)
+    info "以 skip-grant-tables 模式启动临时容器..."
+    docker compose run --no-deps -d --name "$reset_container" mysql \
+        --skip-grant-tables --skip-networking >/dev/null
+
+    # 5) 等待临时数据库就绪
+    info "等待临时数据库就绪..."
+    local waited=0
+    while [[ $waited -lt 60 ]]; do
+        if docker exec "$reset_container" sh -c "mariadb-admin ping 2>/dev/null || mysqladmin ping 2>/dev/null" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 2; waited=$((waited + 2)); printf "."
+    done
+    echo ""
+
+    # 6) 探测客户端并重置密码 (兼容 MariaDB / MySQL)
+    local cli
+    cli=$(docker exec "$reset_container" sh -c "command -v mariadb || command -v mysql" 2>/dev/null | head -1)
+    [[ -n "$cli" ]] || cli="mariadb"
+
+    info "重置 root 密码..."
+    if ! printf "%s\n" \
+        "FLUSH PRIVILEGES;" \
+        "ALTER USER 'root'@'localhost' IDENTIFIED BY '${new_pass}';" \
+        "FLUSH PRIVILEGES;" \
+        | docker exec -i "$reset_container" "$cli" -uroot; then
+        docker rm -f "$reset_container" 2>/dev/null || true
+        docker compose up -d mysql
+        error "重置失败，已尝试恢复正常容器，请查看日志: docker compose logs mysql"
+    fi
+    # root@'%' 账户可能不存在，忽略错误
+    printf "%s\n" \
+        "ALTER USER 'root'@'%' IDENTIFIED BY '${new_pass}';" \
+        "FLUSH PRIVILEGES;" \
+        | docker exec -i "$reset_container" "$cli" -uroot 2>/dev/null || true
+
+    # 7) 关闭临时容器
+    info "关闭临时容器..."
+    docker rm -f "$reset_container" 2>/dev/null || true
+
+    # 8) 同步新密码到 .env 和 .credentials
+    info "更新配置文件中的密码..."
+    if [[ "$(uname)" == "Darwin" ]]; then
+        sed -i '' "s|^MYSQL_ROOT_PASS=.*|MYSQL_ROOT_PASS=$new_pass|" "$PROJECT_DIR/.env"
+        [[ -f "$CREDENTIALS_FILE" ]] && sed -i '' "s|^MySQL Root 密码:.*|MySQL Root 密码: $new_pass|" "$CREDENTIALS_FILE"
+    else
+        sed -i "s|^MYSQL_ROOT_PASS=.*|MYSQL_ROOT_PASS=$new_pass|" "$PROJECT_DIR/.env"
+        [[ -f "$CREDENTIALS_FILE" ]] && sed -i "s|^MySQL Root 密码:.*|MySQL Root 密码: $new_pass|" "$CREDENTIALS_FILE"
+    fi
+
+    # 9) 正常启动并验证
+    info "启动 MySQL 容器..."
+    docker compose up -d mysql
+    info "等待数据库启动..."
+    waited=0
+    while [[ $waited -lt 90 ]]; do
+        if docker compose exec -T mysql sh -c "mariadb-admin ping -h localhost 2>/dev/null || mysqladmin ping -h localhost 2>/dev/null" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 3; waited=$((waited + 3)); printf "."
+    done
+    echo ""
+
+    if docker compose exec -T mysql sh -c "mariadb -uroot -p'$new_pass' -e 'SELECT 1' 2>/dev/null || mysql -uroot -p'$new_pass' -e 'SELECT 1' 2>/dev/null" >/dev/null 2>&1; then
+        log "root 密码重置成功！"
+        echo ""
+        echo -e "  ${BOLD}新的 root 密码:${NC} ${GREEN}$new_pass${NC}"
+        echo -e "  ${DIM}已同步到: $PROJECT_DIR/.env 和 $CREDENTIALS_FILE${NC}"
+        echo ""
+        echo -e "  ${YELLOW}${ICON_WARN} 请记得同步更新你的应用程序数据库连接密码！${NC}"
+    else
+        warn "新密码验证失败，请检查日志: docker compose logs mysql"
+    fi
+}
+
 cmd_uninstall() {
     step "${ICON_WARN} 卸载确认"
     echo ""
@@ -3088,8 +3279,11 @@ cmd_upgrade() {
     fi
     
     # 获取远程版本信息
+    # 临时文件优先建在脚本同目录，使后续 mv 成为同文件系统的原子 rename，
+    # 避免跨文件系统 mv 覆盖正在运行脚本的 inode 导致读到半成品
     local remote_version=""
-    local temp_script=$(mktemp)
+    local temp_script
+    temp_script=$(mktemp "${SCRIPT_DIR}/.deploy-upgrade.XXXXXX" 2>/dev/null || mktemp)
     
     info "检查最新版本..."
     if curl -fsSL --connect-timeout 10 "$SCRIPT_URL" -o "$temp_script" 2>/dev/null; then
@@ -3615,6 +3809,9 @@ main() {
             ;;
         --rebuild-mysql)
             cmd_rebuild_mysql
+            ;;
+        --reset-mysql-password|--reset-mysql-pass)
+            cmd_reset_mysql_password
             ;;
         --uninstall)
             cmd_uninstall
