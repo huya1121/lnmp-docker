@@ -2350,6 +2350,32 @@ docker compose exec -T mysql mariadb -uroot -p dbname < backup.sql
 $0 --reset-mysql-password
 \`\`\`
 
+## 迁移到新环境 / 从全库备份恢复 (重要)
+> ⚠️ 全库备份 (\`--all-databases\`, 即自动备份 \`db_*.sql\`) 包含 \`mysql\` 系统库, 账号权限表 \`user\` 就在其中。整体导入新环境会覆盖新环境的 \`mysql.user\`, 导致 root 密码与 \`.credentials\` 记录不一致、登录失败、健康检查异常。
+>
+> **推荐做法: 只导业务库, 不碰 \`mysql\` 系统库** (新环境 root 密码保持自身不变, 最稳妥)。
+\`\`\`bash
+# 1. 查看备份里有哪些库 (排除 mysql/sys/information_schema/performance_schema 系统库)
+grep -E "^-- Current Database:|^CREATE DATABASE" backups/db_YYYYmmdd_HHMMSS.sql
+
+# 2. 先在新环境建好各业务库
+#    (--one-database 靠 USE 语句过滤, 而 CREATE DATABASE 行在 USE 之前会被过滤掉, 故需手动建)
+docker compose exec mysql mariadb -uroot -p -e \\
+  "CREATE DATABASE IF NOT EXISTS dbname CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+
+# 3. 逐个导入业务库 (--one-database 只作用于该库, mysql 系统库那段被忽略, user 表不受影响)
+docker compose exec -T mysql mariadb -uroot -p --one-database dbname < backups/db_YYYYmmdd_HHMMSS.sql
+
+# 4. 验证各库表数量
+docker compose exec mysql mariadb -uroot -p -e \\
+  "SELECT table_schema '库', COUNT(*) '表数' FROM information_schema.tables WHERE table_schema='dbname';"
+
+# 5. 因未导入 mysql.user, 需按各应用配置里的账号重建数据库用户 (账号/密码与应用配置一致即无需改应用)
+docker compose exec mysql mariadb -uroot -p -e \\
+  "CREATE USER IF NOT EXISTS 'user'@'%' IDENTIFIED BY 'password'; GRANT ALL ON dbname.* TO 'user'@'%'; FLUSH PRIVILEGES;"
+\`\`\`
+> 若确需整库全导 (含 user 表): 导入后新环境 root 密码会变成旧环境的, 必须把旧环境的 \`.credentials\` 与 \`.env\` 中 MYSQL_ROOT_PASSWORD 一并同步到新环境, 再 \`docker compose down && docker compose up -d\`; 若密码错乱连不上, 用 \`$0 --reset-mysql-password\` 重置 (不影响数据)。最后把旧环境 \`volumes/php/www/\` 对应站点目录拷到新环境同路径。
+
 ## Redis 操作
 > 密码见 \`.credentials\` 文件, 把下面的 '你的Redis密码' 替换为实际密码
 \`\`\`bash
