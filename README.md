@@ -252,6 +252,49 @@ docker compose exec -T mysql mysql -u root -p"密码" < ./backups/db_20260812_02
 
 > 注意：恢复时使用 `-T`（禁用伪 TTY），否则重定向输入会失败。
 
+#### 迁移到新环境 / 从全库备份恢复（重要）
+
+> ⚠️ **全库备份（`--all-databases`，也就是自动备份 `db_*.sql`）包含 `mysql` 系统库，而账号权限的 `user` 表就在里面。** 若把全库文件整体导入新环境，会用旧环境的账号数据**覆盖新环境的 `mysql.user`**，导致新环境 `.credentials` 里记录的 root 密码与数据库实际密码对不上、登录失败、健康检查异常。
+
+**推荐做法：只导业务库，不碰 `mysql` 系统库**（新环境 root 密码保持自身不变，最稳妥）。
+
+假设备份文件为 `backups/db_20260903_020005.sql`，业务库为 `maccms10`、`myapp`、`typecho`（`mysql`/`sys`/`information_schema`/`performance_schema` 为系统库，需跳过）。
+
+```bash
+cd ./lnmp
+# 1. 查看备份里有哪些库，识别出业务库
+grep -E "^-- Current Database:|^CREATE DATABASE" backups/db_20260903_020005.sql
+
+# 2. 先在新环境建好各业务库（--one-database 靠 USE 过滤，而 CREATE DATABASE 行会被过滤掉，故需手动建）
+docker compose exec mysql mysql -u root -p"新环境root密码" -e \
+  "CREATE DATABASE IF NOT EXISTS maccms10 CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+   CREATE DATABASE IF NOT EXISTS myapp    CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+   CREATE DATABASE IF NOT EXISTS typecho  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+
+# 3. 逐个导入业务库（--one-database 确保只作用于该库，mysql 系统库那段被忽略，user 表不受影响）
+docker compose exec -T mysql mysql -u root -p"新环境root密码" --one-database maccms10 < backups/db_20260903_020005.sql
+docker compose exec -T mysql mysql -u root -p"新环境root密码" --one-database myapp    < backups/db_20260903_020005.sql
+docker compose exec -T mysql mysql -u root -p"新环境root密码" --one-database typecho  < backups/db_20260903_020005.sql
+
+# 4. 验证各库表数量
+docker compose exec mysql mysql -u root -p"新环境root密码" -e \
+  "SELECT table_schema '库', COUNT(*) '表数' FROM information_schema.tables
+   WHERE table_schema IN ('maccms10','myapp','typecho') GROUP BY table_schema;"
+```
+
+**恢复后重建应用账号**：因为没导入旧环境的 `mysql.user`，各应用连库的账号（如 `appuser`）在新环境不存在，需按各应用配置文件里的账号密码重建：
+
+```bash
+docker compose exec mysql mysql -u root -p"新环境root密码" -e \
+  "CREATE USER IF NOT EXISTS 'appuser'@'%' IDENTIFIED BY '应用密码';
+   GRANT ALL PRIVILEGES ON maccms10.* TO 'appuser'@'%';
+   FLUSH PRIVILEGES;"
+```
+
+> 账号名/密码与应用配置保持一致（苹果CMS 见 `application/database.php`、Typecho 见 `config.inc.php`），应用即无需改配置。若应用本就用 root 连库，则跳过建账号，改为把应用配置里的密码换成新环境 root 密码即可。最后把旧环境 `volumes/php/www/` 对应站点目录拷到新环境同路径。
+
+**若确实要整库全导（含 user 表）**：导入后新环境 root 密码会变成旧环境的，必须把旧环境的 `.credentials` 与 `.env` 中的 `MYSQL_ROOT_PASSWORD` 一并同步到新环境再 `docker compose down && docker compose up -d`；若密码错乱连不上，用 `./deploy-lamp.sh --reset-mysql-password` 重置（不影响数据）。
+
 #### 查看数据库列表与占用大小
 
 ```bash
