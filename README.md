@@ -2,7 +2,10 @@
 # LNMP Docker 自动化部署脚本
 
 一键部署 LNMP (Linux + Nginx + MySQL + PHP + Redis) 环境，支持 Let's Encrypt SSL 证书（单域名/通配符）、自动备份、断点续装等功能。
-
+运行
+```bash
+curl -L https://raw.githubusercontent.com/huya1121/lnmp-docker/refs/heads/main/deploy-lnmp.sh | bash
+```
 ## 🚀 功能特点
 
 - ✅ **一键部署** - 自动安装 Docker、配置服务、申请 SSL 证书
