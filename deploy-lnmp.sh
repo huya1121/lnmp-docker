@@ -161,15 +161,28 @@ get_mariadb_image() {
 }
 
 # 检查磁盘空间
+# 检查磁盘空间
 check_disk_space() {
     local required_mb=${1:-2000}
     local available_mb=0
-    # Cross-platform disk space check
-    if df -m "$SCRIPT_DIR" &>/dev/null; then
-        available_mb=$(df -m "$SCRIPT_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+    
+    # 优先使用 --output 参数（能完美解决 LXC 换行和跨平台列位置不固定的问题）
+    if df -m --output=avail "$SCRIPT_DIR" &>/dev/null; then
+        # tail -n 1 确保只拿最后那行数字，避免被表头或换行干扰
+        available_mb=$(df -m --output=avail "$SCRIPT_DIR" 2>/dev/null | tail -n 1 | tr -d '[:space:]')
+    # 备用方案 1：标准的 df -m，但通过 awk 过滤掉非数字行或直接取最后一行
+    elif df -m "$SCRIPT_DIR" &>/dev/null; then
+        available_mb=$(df -m "$SCRIPT_DIR" 2>/dev/null | awk 'END{print $4}')
+    # 备用方案 2：不支持 -m 的旧系统，读取 KB 并转换
     else
-        # Fallback: use df without -m and convert from KB or blocks
-        available_mb=$(df "$SCRIPT_DIR" 2>/dev/null | awk 'NR==2 {print int($4/1024)}')
+        available_mb=$(df "$SCRIPT_DIR" 2>/dev/null | awk 'END{print int($4/1024)}')
+    fi
+    
+    # 兜底：如果 awk 'END{print $4}' 因为换行导致在最后一行抓错，再做一次纯数字提取
+    # 如果抓到的是非数字（比如空字符），用正规表达式从 df 输出中把纯数字滤出来
+    if [[ ! "$available_mb" =~ ^[0-9]+$ ]]; then
+        # 强力提取：不管换不换行，找倒数第二个或最后一个纯数字字段
+        available_mb=$(df -m "$SCRIPT_DIR" 2>/dev/null | tr '\n' ' ' | awk '{print $(NF-2)}')
     fi
     
     # Ensure we got a valid number
@@ -184,7 +197,6 @@ check_disk_space() {
     fi
     return 0
 }
-
 # ======================== 服务器配置检测 ========================
 # 全局变量存储检测结果
 SERVER_MEM_MB=1024
