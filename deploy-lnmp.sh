@@ -161,28 +161,36 @@ get_mariadb_image() {
 }
 
 # 检查磁盘空间
-# 检查磁盘空间
 check_disk_space() {
     local required_mb=${1:-2000}
     local available_mb=0
     
-    # 优先使用 --output 参数（能完美解决 LXC 换行和跨平台列位置不固定的问题）
+    # 1. 优先使用 --output 参数，只输出数字，完全免疫换行
     if df -m --output=avail "$SCRIPT_DIR" &>/dev/null; then
-        # tail -n 1 确保只拿最后那行数字，避免被表头或换行干扰
         available_mb=$(df -m --output=avail "$SCRIPT_DIR" 2>/dev/null | tail -n 1 | tr -d '[:space:]')
-    # 备用方案 1：标准的 df -m，但通过 awk 过滤掉非数字行或直接取最后一行
-    elif df -m "$SCRIPT_DIR" &>/dev/null; then
-        available_mb=$(df -m "$SCRIPT_DIR" 2>/dev/null | awk 'END{print $4}')
-    # 备用方案 2：不支持 -m 的旧系统，读取 KB 并转换
-    else
-        available_mb=$(df "$SCRIPT_DIR" 2>/dev/null | awk 'END{print int($4/1024)}')
+    fi
+
+    # 2. 如果方法 1 没获取到（或者不支持 --output），使用通用管道去换行处理
+    if [[ ! "$available_mb" =~ ^[1-9][0-9]*$ ]] && [ "$available_mb" != "0" ]; then
+        # 核心原理：xargs 将多行输出压成单行，此时：
+        # $1=Filesystem, $2=1M-blocks, $3=Used, $4=Available, $5=Use%, $6=Mounted
+        # $7=文件系统名, $8=总大小, $9=已用, $10=可用 (如果是换行情况)
+        # 我们直接用 awk 判断总字段数 (NF)，如果是换行(NF>6)，可用空间在倒数第3个字段；如果不换行(NF==6)，可用空间在第4个字段。
+        available_mb=$(df -m "$SCRIPT_DIR" 2>/dev/null | xargs | awk '{
+            if (NF > 6) {
+                print $(NF-2) # 换行时，倒数第三个是 Available
+            } else {
+                print $4      # 不换行时，第四个是 Available
+            }
+        }')
     fi
     
-    # 兜底：如果 awk 'END{print $4}' 因为换行导致在最后一行抓错，再做一次纯数字提取
-    # 如果抓到的是非数字（比如空字符），用正规表达式从 df 输出中把纯数字滤出来
+    # 3. 终极 KB 转换兜底（针对不支持 -m 的古老系统）
     if [[ ! "$available_mb" =~ ^[0-9]+$ ]]; then
-        # 强力提取：不管换不换行，找倒数第二个或最后一个纯数字字段
-        available_mb=$(df -m "$SCRIPT_DIR" 2>/dev/null | tr '\n' ' ' | awk '{print $(NF-2)}')
+        available_mb=$(df "$SCRIPT_DIR" 2>/dev/null | xargs | awk '{
+            val = (NF > 6) ? $(NF-2) : $4
+            print int(val / 1024)
+        }')
     fi
     
     # Ensure we got a valid number
