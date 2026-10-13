@@ -165,34 +165,24 @@ check_disk_space() {
     local required_mb=${1:-2000}
     local available_mb=0
     
-    # 1. 优先使用 --output 参数，只输出数字，完全免疫换行
-    if df -m --output=avail "$SCRIPT_DIR" &>/dev/null; then
+    # 1. 优先用 stat -f 直接读文件系统块信息（可用块数 × 块大小），
+    #    不依赖设备名/df 输出格式，在 Incus/LXC 的 ZFS 后端下同样可靠。
+    available_mb=$(stat -f -c '%a %S' "$SCRIPT_DIR" 2>/dev/null | awk '{
+        if ($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/) printf "%d", ($1 * $2) / 1048576
+    }')
+
+    # 2. 兜底：stat 不可用时用 df --output=avail（只输出数字，免疫换行）
+    if [[ ! "$available_mb" =~ ^[0-9]+$ ]]; then
         available_mb=$(df -m --output=avail "$SCRIPT_DIR" 2>/dev/null | tail -n 1 | tr -d '[:space:]')
     fi
 
-    # 2. 如果方法 1 没获取到（或者不支持 --output），使用通用管道去换行处理
-    if [[ ! "$available_mb" =~ ^[1-9][0-9]*$ ]] && [ "$available_mb" != "0" ]; then
-        # 核心原理：xargs 将多行输出压成单行，此时：
-        # $1=Filesystem, $2=1M-blocks, $3=Used, $4=Available, $5=Use%, $6=Mounted
-        # $7=文件系统名, $8=总大小, $9=已用, $10=可用 (如果是换行情况)
-        # 我们直接用 awk 判断总字段数 (NF)，如果是换行(NF>6)，可用空间在倒数第3个字段；如果不换行(NF==6)，可用空间在第4个字段。
-        available_mb=$(df -m "$SCRIPT_DIR" 2>/dev/null | xargs | awk '{
-            if (NF > 6) {
-                print $(NF-2) # 换行时，倒数第三个是 Available
-            } else {
-                print $4      # 不换行时，第四个是 Available
-            }
-        }')
-    fi
-    
-    # 3. 终极 KB 转换兜底（针对不支持 -m 的古老系统）
+    # 3. 再兜底：老版本 df 不支持 --output，用 xargs 压成单行后按字段数解析
     if [[ ! "$available_mb" =~ ^[0-9]+$ ]]; then
-        available_mb=$(df "$SCRIPT_DIR" 2>/dev/null | xargs | awk '{
-            val = (NF > 6) ? $(NF-2) : $4
-            print int(val / 1024)
+        available_mb=$(df -m "$SCRIPT_DIR" 2>/dev/null | xargs | awk '{
+            print (NF > 6) ? $(NF-2) : $4   # 文件系统名换行时可用空间在倒数第三列，否则在第四列
         }')
     fi
-    
+
     # Ensure we got a valid number
     if [[ ! "$available_mb" =~ ^[0-9]+$ ]]; then
         warn "无法检测磁盘空间"
@@ -570,7 +560,7 @@ check_env() {
     
     # 检查磁盘空间
     info "检查磁盘空间..."
-    check_disk_space 2000 || warn "建议至少保留 2GB 磁盘空间"
+    check_disk_space 2000 || error "磁盘空间不足，需要至少 2GB，安装中止。请清理磁盘后重试"
     
     # 检查内存 (cross-platform)
     local mem_total=0
