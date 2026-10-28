@@ -1248,7 +1248,9 @@ http {
     map \$http_user_agent \$bad_bot {
         default 0;
         "" 1;
-        "~*(SemrushBot|AhrefsBot|MJ12bot|DotBot|PetalBot|Bytespider|GPTBot|ClaudeBot|CCBot|DataForSeoBot|BLEXBot|serpstatbot|ZoominfoBot)" 1;
+        "~*(SemrushBot|AhrefsBot|MJ12bot|DotBot|PetalBot|Bytespider|GPTBot|ClaudeBot|CCBot|DataForSeoBot|BLEXBot|serpstatbot|ZoominfoBot|YisouSpider)" 1;
+        # 中国采集/SEO/已停运搜索类爬虫 (不含百度/搜狗/360/神马 等正规搜索引擎，保留收录)
+        "~*(EasouSpider|JikeSpider|EtaoSpider|YoudaoBot|MauiBot|EasouBot|YYSpider|LinkpadBot|Ezooms)" 1;
         "~*(python-requests|Go-http-client|libwww-perl|^curl/|^Wget|masscan|nmap|nikto|sqlmap|zgrab|WinHttp|Hello)" 1;
     }
 
@@ -1343,7 +1345,9 @@ http {
     map \$http_user_agent \$bad_bot {
         default 0;
         "" 1;
-        "~*(SemrushBot|AhrefsBot|MJ12bot|DotBot|PetalBot|Bytespider|GPTBot|ClaudeBot|CCBot|DataForSeoBot|BLEXBot|serpstatbot|ZoominfoBot)" 1;
+        "~*(SemrushBot|AhrefsBot|MJ12bot|DotBot|PetalBot|Bytespider|GPTBot|ClaudeBot|CCBot|DataForSeoBot|BLEXBot|serpstatbot|ZoominfoBot|YisouSpider)" 1;
+        # 中国采集/SEO/已停运搜索类爬虫 (不含百度/搜狗/360/神马 等正规搜索引擎，保留收录)
+        "~*(EasouSpider|JikeSpider|EtaoSpider|YoudaoBot|MauiBot|EasouBot|YYSpider|LinkpadBot|Ezooms)" 1;
         "~*(python-requests|Go-http-client|libwww-perl|^curl/|^Wget|masscan|nmap|nikto|sqlmap|zgrab|WinHttp|Hello)" 1;
     }
 
