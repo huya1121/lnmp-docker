@@ -2,7 +2,7 @@
 set -eo pipefail
 
 # ======================== 版本和配置 ========================
-VERSION="2.9.0"
+VERSION="2.10.0"
 SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy-lnmp.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
@@ -402,9 +402,18 @@ save_progress() {
         printf 'MYSQL_ROOT_PASS=%q\n' "$MYSQL_ROOT_PASS"
         printf 'REDIS_PASSWORD=%q\n' "$REDIS_PASSWORD"
         echo "PHP_VERSION=$PHP_VERSION"
+        echo "MARIADB_VERSION=$MARIADB_VERSION"
         echo "INSTALL_PHPMYADMIN=$INSTALL_PHPMYADMIN"
+        echo "INSTALL_FAIL2BAN=${INSTALL_FAIL2BAN:-yes}"
         echo "NGINX_TYPE=$NGINX_TYPE"
         echo "SUBDOMAINS=(${subdomains_str})"
+        # DNS 通配符证书凭据：续装时 config 阶段会被跳过，不持久化会导致
+        # cert 阶段重跑时凭据为空、certbot 永远失败而死循环 (用 %q 安全转义)
+        printf 'CF_TOKEN=%q\n'    "${CF_TOKEN:-}"
+        printf 'ALI_KEY=%q\n'     "${ALI_KEY:-}"
+        printf 'ALI_SECRET=%q\n'  "${ALI_SECRET:-}"
+        printf 'DP_ID=%q\n'       "${DP_ID:-}"
+        printf 'DP_TOKEN=%q\n'    "${DP_TOKEN:-}"
     } > "$PROGRESS_FILE"
     # 进度文件含数据库/Redis 密码，限制为仅 root 可读
     chmod 600 "$PROGRESS_FILE" 2>/dev/null || true
@@ -465,6 +474,7 @@ show_help() {
     echo ""
     echo -e "${BOLD}安全防护 (WAF + fail2ban):${NC}"
     echo -e "  ${CYAN}--setup-waf${NC}      为现有部署启用 WAF + fail2ban + 网页解封面板"
+    echo -e "  ${CYAN}--reset-f2b-password${NC}  重置网页解封面板登录密码 (用户名固定 admin)"
     echo -e "  ${CYAN}--f2b-status${NC}     查看当前被封禁的 IP"
     echo -e "  ${CYAN}--f2b-unban <IP>${NC} 解封指定 IP"
     echo -e "  ${CYAN}--f2b-ban <IP>${NC}   手动封禁指定 IP"
@@ -888,15 +898,24 @@ collect_credentials() {
     
     case "$pwd_choice" in
         2)
-            printf "${GREEN}  请输入 MySQL root 密码: ${NC}"
-            IFS= read -r MYSQL_ROOT_PASS || MYSQL_ROOT_PASS=""
-            echo ""
-            if [[ -z "$MYSQL_ROOT_PASS" ]]; then
-                MYSQL_ROOT_PASS=$(generate_strong_password)
-                echo -e "  ${YELLOW}${ICON_WARN}${NC} 密码为空，已自动生成强密码"
-            else
-                echo -e "  ${GREEN}${ICON_OK}${NC} 密码已设置"
-            fi
+            # 手动密码会被写入 .env (同时被 bash source 和 docker compose 解析)，
+            # 含空格/引号/$/#/反斜杠等会破坏解析甚至 source 时执行命令。限制为
+            # 字母数字加一组对两种解析器都安全的符号，含其它字符则要求重输。
+            while true; do
+                printf "${GREEN}  请输入 MySQL root 密码 (允许 A-Z a-z 0-9 及 ._-+=@): ${NC}"
+                IFS= read -r MYSQL_ROOT_PASS || MYSQL_ROOT_PASS=""
+                echo ""
+                if [[ -z "$MYSQL_ROOT_PASS" ]]; then
+                    MYSQL_ROOT_PASS=$(generate_strong_password)
+                    echo -e "  ${YELLOW}${ICON_WARN}${NC} 密码为空，已自动生成强密码"
+                    break
+                elif [[ "$MYSQL_ROOT_PASS" =~ ^[A-Za-z0-9._+=@-]+$ ]]; then
+                    echo -e "  ${GREEN}${ICON_OK}${NC} 密码已设置"
+                    break
+                else
+                    echo -e "  ${RED}${ICON_FAIL}${NC} 含不允许的字符，请仅使用 A-Z a-z 0-9 及 ._-+=@ 重试"
+                fi
+            done
             ;;
         *)
             MYSQL_ROOT_PASS=$(generate_strong_password)
@@ -1160,7 +1179,26 @@ setup_nginx_main_config() {
     # 获取动态参数
     local worker_connections=$(get_nginx_worker_connections)
     local client_body_buffer=$(get_nginx_client_body_buffer)
-    
+
+    # Cloudflare 真实 IP 还原: 站点在 CF 后面时，$remote_addr 是 CF 边缘 IP，
+    # 会导致限流/日志/fail2ban 针对 CF 而非真实访客 (封 CF = 全站打不开)。
+    # 用 real_ip + CF-Connecting-IP 把 $remote_addr 还原为真实客户端。
+    # 仅当使用 Cloudflare DNS (通配符证书) 时注入，其它情况为空。
+    CF_REALIP_BLOCK=""
+    if [[ "${DNS_PROVIDER:-}" == "cloudflare" ]]; then
+        CF_REALIP_BLOCK=$'    # --- Cloudflare 真实客户端 IP 还原 ---\n'
+        local _cidr
+        for _cidr in 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 \
+                     141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 \
+                     197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 \
+                     104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 \
+                     2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 \
+                     2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32; do
+            CF_REALIP_BLOCK+="    set_real_ip_from ${_cidr};"$'\n'
+        done
+        CF_REALIP_BLOCK+=$'    real_ip_header CF-Connecting-IP;\n    real_ip_recursive on;\n'
+    fi
+
     if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
         # linuxserver/nginx uses /config/nginx/ for configuration
         _create_linuxserver_nginx_config "$worker_connections" "$client_body_buffer"
@@ -1239,6 +1277,7 @@ http {
     client_header_timeout 30;
     send_timeout 30;
 
+${CF_REALIP_BLOCK}
     # 限流配置 (防止 DDoS)
     limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=20r/s;
     limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
@@ -1255,7 +1294,9 @@ http {
     }
 
     # WAF: 敏感/扫描路径黑名单 (配置文件、版本控制、后台探测)。命中 \$bad_path=1。
-    map \$request_uri \$bad_path {
+    # 用 \$uri (已解码+规范化) 而非 \$request_uri (原始未解码)，否则 /%2egit 这类
+    # 百分号编码可绕过字面正则。注意 \$uri 不含 query string，纯路径匹配正合适。
+    map \$uri \$bad_path {
         default 0;
         "~*(\.env|\.git|\.svn|\.hg|/wp-login\.php|/xmlrpc\.php|/vendor/|/\.aws|/phpunit|/\.ssh|/config\.php\.bak|/\.DS_Store)" 1;
     }
@@ -1336,6 +1377,7 @@ http {
     client_header_timeout 30;
     send_timeout 30;
 
+${CF_REALIP_BLOCK}
     # 限流配置 (防止 DDoS)
     limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=20r/s;
     limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
@@ -1352,7 +1394,9 @@ http {
     }
 
     # WAF: 敏感/扫描路径黑名单 (配置文件、版本控制、后台探测)。命中 \$bad_path=1。
-    map \$request_uri \$bad_path {
+    # 用 \$uri (已解码+规范化) 而非 \$request_uri (原始未解码)，否则 /%2egit 这类
+    # 百分号编码可绕过字面正则。注意 \$uri 不含 query string，纯路径匹配正合适。
+    map \$uri \$bad_path {
         default 0;
         "~*(\.env|\.git|\.svn|\.hg|/wp-login\.php|/xmlrpc\.php|/vendor/|/\.aws|/phpunit|/\.ssh|/config\.php\.bak|/\.DS_Store)" 1;
     }
@@ -1420,11 +1464,17 @@ inject_waf_include() {
     local f count=0
     for f in "$nginx_conf_dir"/*.conf; do
         [[ -f "$f" ]] || continue
-        # 跳过纯 HTTP 重定向配置 (00-http-redirect.conf) 和已含 include 的文件
+        # 跳过已含 include 的文件 (幂等)
         grep -q "waf-guard.conf" "$f" 2>/dev/null && continue
         grep -q "listen 443" "$f" 2>/dev/null || continue
-        # 在每个 "server {" 行后插入 include (仅限含 443 的文件)
-        sed -i "/^server[[:space:]]*{/a\\${include_line}" "$f"
+        # 只在 "listen 443" 那一行后插入一次 include —— 必落在 443 server 块内。
+        # 不能用 sed /^server {/a：文件里常同时有 80 跳转块和 443 块，那样会插进
+        # 每个 server 块，导致 waf-guard 的 limit_req 在 80 块重复 (nginx 报
+        # "limit_req directive is duplicate")，且 80 跳转块本就无需 WAF。
+        awk -v inc="$include_line" '
+            !done && /listen/ && /443/ { print; print inc; done=1; next }
+            { print }
+        ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
         count=$((count + 1))
     done
     [[ $count -gt 0 ]] && log "已为 $count 个站点配置注入 WAF include"
@@ -2319,7 +2369,8 @@ if ! docker exec lnmp_mysql command -v mariadb-dump &>/dev/null; then
     DUMP_CMD="mysqldump"
 fi
 
-if docker exec lnmp_mysql $DUMP_CMD -uroot -p"$MYSQL_ROOT_PASS" --all-databases > "$BACKUP_DIR/db_$DATE.sql" 2>/dev/null; then
+# 通过 MYSQL_PWD 环境变量传密码，避免 -p<pass> 暴露在宿主机进程列表 (ps/docker top)
+if docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASS" lnmp_mysql $DUMP_CMD -uroot --all-databases > "$BACKUP_DIR/db_$DATE.sql" 2>/dev/null; then
     echo "[$(date)] 数据库备份成功: db_$DATE.sql (使用 $DUMP_CMD)"
 else
     echo "[$(date)] 数据库备份失败"
@@ -2498,8 +2549,12 @@ setup_f2b_bridge() {
     local bridge="$PROJECT_DIR/f2b_bridge.sh"
     local f2b_dir="$PROJECT_DIR/volumes/fail2ban"
     mkdir -p "$f2b_dir"
-    # 目录需让 PHP 容器内 www-data 能写 unban-queue (bind mount 按 UID 映射)
-    chmod 777 "$f2b_dir" 2>/dev/null || true
+    # 目录需让 PHP 容器内 www-data 写 unban-queue (bind mount 按 UID 映射)。
+    # php:*-fpm-alpine 的 www-data 为 UID/GID 82 —— 把目录归属给它并用 0770，
+    # 既满足面板写入，又避免 0777 让宿主机上任意本地用户都能投递队列、
+    # 借 root 桥接脚本封禁/加白任意 IP。root (cron 跑桥接) 本就不受权限限制。
+    chown 82:82 "$f2b_dir" 2>/dev/null || true
+    chmod 770 "$f2b_dir" 2>/dev/null || true
 
     # 桥接脚本需要知道 nginx access.log 的宿主机路径 (随 NGINX_TYPE)，安装时实填
     local access_log; access_log=$(get_nginx_access_log)
@@ -2544,7 +2599,8 @@ drain_queue() {
     [[ -s "$q" ]] || return 0
     local tmp="$q.processing.$$"
     mv "$q" "$tmp" 2>/dev/null || { cp "$q" "$tmp"; : > "$q"; }
-    : > "$q"; chmod 666 "$q" 2>/dev/null || true
+    # 重建空队列后归属给 www-data(82) 并用 660，仅面板可写，不对全机开放
+    : > "$q"; chown 82:82 "$q" 2>/dev/null || true; chmod 660 "$q" 2>/dev/null || true
     cat "$tmp"; rm -f "$tmp"
 }
 
@@ -2797,6 +2853,10 @@ return [
     'lock_seconds'  => 900,                   // 锁定时长 (15 分钟)
 ];
 EOFCFG
+    # 含 bcrypt hash 与 secret，限权 640 (属主 root 写、php 容器 www-data 同组读)，
+    # 不对宿主机其他本地用户开放。文件在 public/ 之外，本就不经 web 暴露。
+    chown root:82 "$root/config/panel.php" 2>/dev/null || true
+    chmod 640 "$root/config/panel.php" 2>/dev/null || true
 
     # ---- lib/auth.php ----
     cat > "$root/lib/auth.php" << 'EOFAUTH'
@@ -2820,32 +2880,48 @@ function f2b_require_login() {
     if (!f2b_is_logged_in()) { header('Location: login.php'); exit; }
 }
 
-// 失败锁定: 把失败计数存到 f2b_dir/.login_fails (JSON: {fails,until})
+// 失败锁定: 按客户端 IP 分桶存到 f2b_dir/.login_fails (JSON: {ip:{fails,until}})。
+// 按 IP 计数而非全局——否则攻击者可持续失败把管理员永久锁在门外 (DoS)。
 function f2b_lock_file() { return f2b_cfg()['f2b_dir'] . '/.login_fails'; }
-function f2b_read_lock() {
+function f2b_client_ip() {
+    // 面板经 nginx->php-fpm，优先取 nginx 传入的真实 IP；回退 REMOTE_ADDR
+    foreach (['HTTP_CF_CONNECTING_IP','HTTP_X_REAL_IP','REMOTE_ADDR'] as $k) {
+        if (!empty($_SERVER[$k]) && filter_var($_SERVER[$k], FILTER_VALIDATE_IP)) return $_SERVER[$k];
+    }
+    return 'unknown';
+}
+function f2b_read_locks() {
     $f = f2b_lock_file();
     if (is_readable($f)) { $d = json_decode(@file_get_contents($f), true); if (is_array($d)) return $d; }
-    return ['fails'=>0, 'until'=>0];
+    return [];
 }
-function f2b_write_lock($d){ @file_put_contents(f2b_lock_file(), json_encode($d), LOCK_EX); }
-function f2b_is_locked(){ $d=f2b_read_lock(); return $d['until'] > time(); }
-function f2b_lock_remaining(){ $d=f2b_read_lock(); return max(0, $d['until'] - time()); }
+function f2b_write_locks($d){ @file_put_contents(f2b_lock_file(), json_encode($d), LOCK_EX); }
+function f2b_lock_entry($ip){ $all=f2b_read_locks(); return $all[$ip] ?? ['fails'=>0,'until'=>0]; }
+function f2b_is_locked(){ $e=f2b_lock_entry(f2b_client_ip()); return ($e['until'] ?? 0) > time(); }
+function f2b_lock_remaining(){ $e=f2b_lock_entry(f2b_client_ip()); return max(0, ($e['until'] ?? 0) - time()); }
 
 function f2b_try_login($user, $pass) {
     $c = f2b_cfg();
+    $ip = f2b_client_ip();
     if (f2b_is_locked()) return false;
     $ok = hash_equals($c['user'], (string)$user) && !empty($c['pass_hash']) && password_verify($pass, $c['pass_hash']);
+    $all = f2b_read_locks();
+    // 顺带清理已过期的 IP 条目，避免文件无限增长
+    $now = time();
+    foreach ($all as $k => $v) { if (($v['until'] ?? 0) < $now && ($v['fails'] ?? 0) === 0) unset($all[$k]); }
     if ($ok) {
         session_regenerate_id(true);
         $_SESSION['f2b_auth'] = true;
         $_SESSION['f2b_user'] = $user;
-        f2b_write_lock(['fails'=>0, 'until'=>0]);
+        unset($all[$ip]);
+        f2b_write_locks($all);
         return true;
     }
-    $d = f2b_read_lock();
-    $d['fails'] = ($d['fails'] ?? 0) + 1;
-    if ($d['fails'] >= $c['max_fails']) { $d['until'] = time() + $c['lock_seconds']; $d['fails'] = 0; }
-    f2b_write_lock($d);
+    $e = $all[$ip] ?? ['fails'=>0, 'until'=>0];
+    $e['fails'] = ($e['fails'] ?? 0) + 1;
+    if ($e['fails'] >= $c['max_fails']) { $e['until'] = time() + $c['lock_seconds']; $e['fails'] = 0; }
+    $all[$ip] = $e;
+    f2b_write_locks($all);
     return false;
 }
 
@@ -2876,7 +2952,7 @@ function f2b_enqueue($action, $ip) {
     if (@file_put_contents($file, $ip . "\n", FILE_APPEND | LOCK_EX) === false) {
         return [false, '写入队列失败 (检查目录权限)'];
     }
-    @chmod($file, 0666);
+    @chmod($file, 0660);  // 仅属主(www-data)与同组可写，不对全机开放
     return [true, '已提交，约 1 分钟内生效'];
 }
 
@@ -3246,6 +3322,61 @@ _f2b_finalize_hash() {
     else
         warn "仍无法生成面板哈希，请确认 PHP 容器已运行"
     fi
+}
+
+# 重置/查询 fail2ban 网页面板密码。
+# 面板密码在 config/panel.php 中仅以 bcrypt 保存 (不可逆)，明文只在安装时写入
+# .credentials。若 .credentials 丢失该行，明文已无法找回，只能重设新密码。
+cmd_reset_f2b_password() {
+    step "${ICON_LOCK} 重置 fail2ban 面板密码"
+
+    local cfg="$PROJECT_DIR/fail2ban-panel/config/panel.php"
+    [[ -f "$cfg" ]] || error "未找到面板配置 $cfg，请先运行 $0 --setup-waf"
+    [[ -f "$PROJECT_DIR/.env" ]] && source "$PROJECT_DIR/.env"
+    cd "$PROJECT_DIR" 2>/dev/null || error "项目目录不存在"
+
+    # 确认 PHP 容器可用 (算 bcrypt 要用它)
+    if ! docker compose exec -T php php -v >/dev/null 2>&1; then
+        error "PHP 容器未运行，无法生成密码哈希。请先 $0 --restart"
+    fi
+
+    echo ""
+    echo -e "  ${DIM}面板用户名固定为 ${BOLD}admin${NC}${DIM}。此操作只改面板登录密码，不影响封禁数据。${NC}"
+    echo -e "  ${DIM}留空直接回车则自动生成一个 20 位强密码。${NC}"
+    echo ""
+    printf "${GREEN}  请输入新密码 (回车=自动生成): ${NC}"
+    local new_pass=""; IFS= read -rs new_pass; echo ""
+    if [[ -z "$new_pass" ]]; then
+        new_pass=$(generate_strong_password 20)
+        info "已自动生成密码"
+    fi
+
+    # 生成 bcrypt 哈希
+    local h
+    h=$(docker compose exec -T php php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$new_pass" 2>/dev/null | tr -d '\r\n')
+    [[ -n "$h" ]] || error "密码哈希生成失败，请确认 PHP 容器正常"
+
+    # 写回 panel.php (兼容原值为空或已有旧哈希两种情况；用 | 作 sed 分隔符避开哈希里的 /)
+    local h_esc; h_esc=$(printf '%s' "$h" | sed -e 's/[|&]/\\&/g')
+    sed -i "s|'pass_hash'[[:space:]]*=>[[:space:]]*'[^']*'|'pass_hash'     => '${h_esc}'|" "$cfg"
+
+    # 明文补写 .credentials (先删旧的面板三行再追加，保持幂等)
+    if [[ -f "$CREDENTIALS_FILE" ]]; then
+        sed -i '/^解封面板/d' "$CREDENTIALS_FILE" 2>/dev/null || true
+    fi
+    {
+        echo "解封面板地址: https://${DOMAIN:-你的域名}/f2b/"
+        echo "解封面板用户: admin"
+        echo "解封面板密码: ${new_pass}"
+    } >> "$CREDENTIALS_FILE"
+    chmod 600 "$CREDENTIALS_FILE" 2>/dev/null || true
+
+    echo ""
+    log "面板密码已重置"
+    echo -e "  ${BOLD}用户:${NC} ${CYAN}admin${NC}"
+    echo -e "  ${BOLD}密码:${NC} ${CYAN}${new_pass}${NC}"
+    echo -e "  ${DIM}已写入 $CREDENTIALS_FILE${NC}"
+    echo -e "  ${DIM}面板读取配置是实时的，无需重启容器，直接用新密码登录即可。${NC}"
 }
 
 # 将面板 include 注入主域名的 443 server 块 (幂等)
@@ -4402,7 +4533,7 @@ cmd_reset_mysql_password() {
 
     # 1) 先检测当前记录的密码是否其实可用 (可能只是应用端配错了)
     if [[ -n "${MYSQL_ROOT_PASS:-}" ]] && docker compose ps mysql 2>/dev/null | grep -q "Up"; then
-        if docker compose exec -T mysql sh -c "mariadb -uroot -p'$MYSQL_ROOT_PASS' -e 'SELECT 1' 2>/dev/null || mysql -uroot -p'$MYSQL_ROOT_PASS' -e 'SELECT 1' 2>/dev/null" >/dev/null 2>&1; then
+        if docker compose exec -T -e MYSQL_PWD="$MYSQL_ROOT_PASS" mysql sh -c "mariadb -uroot -e 'SELECT 1' 2>/dev/null || mysql -uroot -e 'SELECT 1' 2>/dev/null" >/dev/null 2>&1; then
             echo ""
             warn ".env 中记录的 root 密码其实是可用的！"
             echo -e "  ${DIM}很可能是你的应用/连接工具里的密码写错了，而不是数据库密码丢失。${NC}"
@@ -4513,7 +4644,7 @@ cmd_reset_mysql_password() {
     done
     echo ""
 
-    if docker compose exec -T mysql sh -c "mariadb -uroot -p'$new_pass' -e 'SELECT 1' 2>/dev/null || mysql -uroot -p'$new_pass' -e 'SELECT 1' 2>/dev/null" >/dev/null 2>&1; then
+    if docker compose exec -T -e MYSQL_PWD="$new_pass" mysql sh -c "mariadb -uroot -e 'SELECT 1' 2>/dev/null || mysql -uroot -e 'SELECT 1' 2>/dev/null" >/dev/null 2>&1; then
         log "root 密码重置成功！(已验证 root@localhost)"
         echo ""
         echo -e "  ${BOLD}新的 root 密码:${NC} ${GREEN}$new_pass${NC}"
@@ -4558,9 +4689,11 @@ cmd_uninstall() {
     crontab "$temp_cron" 2>/dev/null || true
     rm -f "$temp_cron"
     
-    # 备份凭据
+    # 备份凭据 (含明文密码，须保持 600；install -m600 原子创建，避免 cp 默认 644)
     if [[ -f "$CREDENTIALS_FILE" ]]; then
-        cp "$CREDENTIALS_FILE" "$SCRIPT_DIR/credentials_backup_$(date +%Y%m%d).txt"
+        local cred_backup="$SCRIPT_DIR/credentials_backup_$(date +%Y%m%d).txt"
+        install -m 600 "$CREDENTIALS_FILE" "$cred_backup" 2>/dev/null \
+            || { cp "$CREDENTIALS_FILE" "$cred_backup"; chmod 600 "$cred_backup"; }
         info "凭据已备份到 $SCRIPT_DIR/"
     fi
     
@@ -5010,12 +5143,17 @@ run_full_install() {
     if [[ $stage_index -le 7 ]]; then
         setup_nginx_final
         setup_index_page
-        # WAF 守卫 include 已由 setup_nginx_final 写入各站点模板；
-        # 这里装 fail2ban + 网页解封面板 (站点配置此时已生成，注入 include 才有目标)
-        install_fail2ban
-        setup_fail2ban_config
-        setup_f2b_panel
-        setup_f2b_bridge
+        # WAF 守卫 include 已由 setup_nginx_final 写入各站点模板；WAF (拦 bad bot +
+        # 限流) 是纯 nginx 配置、始终启用。fail2ban + 网页解封面板为可选项，
+        # 由 INSTALL_FAIL2BAN 控制 (主菜单选 1 只装 LNMP 时为 no)。
+        if [[ "${INSTALL_FAIL2BAN:-yes}" == "yes" ]]; then
+            install_fail2ban
+            setup_fail2ban_config
+            setup_f2b_panel
+            setup_f2b_bridge
+        else
+            info "已跳过 fail2ban 安装 (WAF 拦截与限流仍生效)；如需启用可随时运行: $0 --setup-waf"
+        fi
         save_progress "services"
     fi
     
@@ -5090,7 +5228,9 @@ run_full_install() {
     for sub in "${SUBDOMAINS[@]}"; do
         echo -e "     子域名:       ${CYAN}https://${sub}.${DOMAIN}${NC}"
     done
-    echo -e "     解封面板:     ${CYAN}https://$DOMAIN/f2b/${NC}  ${DIM}(fail2ban 网页管理，凭据见下)${NC}"
+    if [[ "${INSTALL_FAIL2BAN:-yes}" == "yes" ]]; then
+        echo -e "     解封面板:     ${CYAN}https://$DOMAIN/f2b/${NC}  ${DIM}(fail2ban 网页管理，凭据见下)${NC}"
+    fi
     if [[ "$INSTALL_PHPMYADMIN" == "yes" ]]; then
         echo -e "     phpMyAdmin:   ${CYAN}http://$DOMAIN:8080${NC}"
     fi
@@ -5115,8 +5255,13 @@ run_full_install() {
     echo -e "     $0 --restart   重启服务"
     echo -e "     $0 --backup    立即备份"
     echo ""
-    # WAF / fail2ban / 解封面板信息
-    _print_f2b_summary
+    # WAF / fail2ban / 解封面板信息 (仅在安装了 fail2ban 时展示)
+    if [[ "${INSTALL_FAIL2BAN:-yes}" == "yes" ]]; then
+        _print_f2b_summary
+    else
+        echo -e "  ${ICON_LOCK} ${BOLD}fail2ban:${NC} 未安装 ${DIM}(WAF 拦截与限流已启用；如需 IP 自动封禁+解封面板，运行 $0 --setup-waf)${NC}"
+        echo ""
+    fi
     echo -e "${DIM}  详细说明请查看: $README_FILE${NC}"
     echo ""
 }
@@ -5127,17 +5272,19 @@ show_main_menu() {
     show_banner
     echo -e "  ${BOLD}请选择要执行的操作:${NC}"
     echo ""
-    echo -e "    ${CYAN}1)${NC} 安装 LNMP        ${DIM}完整安装向导 (Nginx + MySQL + PHP + Redis + SSL)${NC}"
-    echo -e "    ${CYAN}2)${NC} 安装 fail2ban    ${DIM}为现有部署启用 WAF + fail2ban + 网页解封面板${NC}"
+    echo -e "    ${CYAN}1)${NC} 安装 LNMP        ${DIM}只装 Nginx + MySQL + PHP + Redis + SSL (不含 fail2ban)${NC}"
+    echo -e "    ${CYAN}2)${NC} 安装 fail2ban    ${DIM}为现有部署启用 fail2ban + 网页解封面板${NC}"
     echo ""
     echo -e "    ${CYAN}0)${NC} 退出"
     echo ""
-    echo -e "${DIM}  提示: 其它运维操作请用命令行参数，如 $0 --help${NC}"
+    echo -e "${DIM}  说明: 选 1 的 WAF 拦截与限流照常启用，仅不安装 fail2ban 自动封禁；${NC}"
+    echo -e "${DIM}        装好 LNMP 后可随时选 2 (或运行 $0 --setup-waf) 补装 fail2ban。${NC}"
+    echo -e "${DIM}        其它运维操作请用命令行参数，如 $0 --help${NC}"
     echo ""
     printf "${GREEN}  请输入选项 [0-2]: ${NC}"
     local choice; IFS= read -r choice || choice=""
     case "$choice" in
-        1) run_full_install ;;
+        1) INSTALL_FAIL2BAN="no"; run_full_install ;;
         2) cmd_setup_waf ;;
         0|"") echo -e "${DIM}  已退出${NC}"; exit 0 ;;
         *) error "无效选项: $choice" ;;
@@ -5215,6 +5362,9 @@ main() {
             ;;
         --reset-mysql-password|--reset-mysql-pass)
             cmd_reset_mysql_password
+            ;;
+        --reset-f2b-password|--reset-f2b-pass)
+            cmd_reset_f2b_password
             ;;
         --uninstall)
             cmd_uninstall
