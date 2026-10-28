@@ -2,7 +2,7 @@
 
 > **L**inux + **N**ginx + **M**ySQL/MariaDB + **P**HP + **R**edis，基于 Docker 的生产级自动化部署脚本。
 >
-> 版本 **v2.9.0** · 单文件 `deploy.sh` · 交互式向导 + 全套运维子命令
+> 版本 **v2.10.0** · 单文件 `deploy.sh` · 交互式向导 + 全套运维子命令
 
 一条命令把一台干净的 Linux 服务器变成带 **自动 HTTPS、WAF 防护、fail2ban 封禁、定时备份** 的 LNMP 环境。所有服务跑在 Docker 容器里，互不污染宿主机。
 
@@ -46,7 +46,7 @@
 
 ```bash
 # 1. 下载脚本
-curl -fsSL -o deploy.sh https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy.sh
+curl -fsSL -o deploy.sh https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy-lnmp.sh
 chmod +x deploy.sh
 
 # 2. 运行完整安装向导（无参数即进入向导）
@@ -119,6 +119,7 @@ lnmp/
 
 # ---- 安全防护 ----
 ./deploy.sh --setup-waf          # 为现有部署启用 WAF + fail2ban + 解封面板
+./deploy.sh --reset-f2b-password # 重置解封面板登录密码（用户名固定 admin）
 ./deploy.sh --f2b-status         # 查看被封禁的 IP
 ./deploy.sh --f2b-unban <IP>     # 解封指定 IP
 ./deploy.sh --f2b-ban <IP>       # 手动封禁指定 IP
@@ -197,6 +198,36 @@ docker compose exec -T mysql mariadb -uroot -p dbname < backup.sql
 curl -A "EasouSpider" -I https://你的域名/   # 被封：连接直接关闭
 curl -A "Baiduspider" -I https://你的域名/   # 未封：正常 200
 ```
+
+---
+
+## 📝 更新日志
+
+### v2.10.0 （2026-10-29）
+
+**新增**
+- 无参数运行改为**交互式主菜单**：`1) 安装 LNMP`、`2) 安装 fail2ban`，带参数的运维子命令行为不变。
+- 新增 `--reset-f2b-password` 子命令：重置网页解封面板登录密码（用户名固定 `admin`），回车留空自动生成 20 位强密码，明文补写 `.credentials`，无需重启容器。
+- 安装完成界面的「访问地址」直接列出**网站首页 / 子域名 / 解封面板 `/f2b/` / phpMyAdmin**。
+- 爬虫黑名单新增 `YisouSpider` 及一批中国采集 / SEO / 已停运搜索类爬虫（`EasouSpider`、`JikeSpider`、`EtaoSpider`、`YoudaoBot`、`YYSpider`、`MauiBot`、`LinkpadBot`、`Ezooms` 等）；保留百度 / 搜狗 / 360 收录。
+
+**修复**
+- **fail2ban 启动失败**（`jail lnmp-nginx 不存在` / 服务 `failed`）：`setup_fail2ban_config` 现在会预先创建 nginx access 日志占位文件，避免 fail2ban 因 `logpath` 不存在而整体加载失败。
+- **解封面板 `/f2b/` 返回 404**：面板静态目录此前只挂载到 php 容器，nginx 容器看不到文件。现已在三种 nginx（official / standard / linuxserver）的挂载中补上 `./fail2ban-panel:/var/www/html/_f2bapp:ro`。
+- **nginx 启动报 `limit_req directive is duplicate`**：`inject_waf_include` 此前用 `sed /^server {/a` 会把 WAF include 同时插入 80 跳转块和 443 块，导致 `limit_req` 重复。现改为只在 `listen 443` 行后注入一次。
+
+**安全加固**
+- **数据库密码不再暴露在进程列表**：备份脚本与密码重置改用 `MYSQL_PWD` 环境变量传递，不再用 `-p<密码>` 命令行参数（此前宿主机 `ps` / `docker top` 可见 root 密码，且每日定时备份反复暴露）。
+- **fail2ban 桥接目录/队列文件收紧权限**：目录由 `0777` 改为 `0770` 并归属 PHP 容器 UID，队列文件由 `0666` 改为 `0660`（此前本机任意普通用户都能投递队列，借 root 桥接封禁或加白任意 IP）。
+- **凭据备份文件权限修正**：卸载时的 `credentials_backup_*.txt` 改用 `install -m600` 创建，不再是 world-readable 的 `0644`。
+- **面板配置文件限权**：`config/panel.php`（含 bcrypt 哈希与 secret）写入后设为 `0640`，宿主机其他本地用户不可读。
+- **Cloudflare 真实客户端 IP 还原**：使用 Cloudflare DNS（通配符证书）时，主 `nginx.conf` 自动注入 `set_real_ip_from`（CF 官方网段）+ `real_ip_header CF-Connecting-IP`，使限流、日志、fail2ban 针对真实访客而非 CF 边缘 IP（否则会误封 Cloudflare 导致全站不可达）。
+- **WAF 路径黑名单抗绕过**：`$bad_path` 的匹配变量由 `$request_uri`（原始未解码）改为 `$uri`（已解码+规范化），堵住 `/%2egit` 等百分号编码绕过。
+- **解封面板登录锁定改为按 IP 计数**：此前全局计数，攻击者可持续失败把管理员永久锁死；现每个来源 IP 独立计数，单 IP 被锁不影响其他人。
+- **通配符证书断点续装不再死循环**：DNS 凭据（CF_TOKEN / 阿里云 / DNSPod）与数据库版本现随安装进度持久化，cert 阶段失败重跑不再因凭据丢失而反复失败。
+- **手动数据库密码字符校验**：手动输入 MySQL 密码时限制为 `A-Z a-z 0-9 ._-+=@`，避免特殊字符破坏 `.env` 解析（自动生成的密码不受影响）。
+
+> 升级到本版本后，若要让上述修复与挂载变更作用到**已有部署**，运行 `./deploy.sh --reconfig`（不影响数据、证书与站点文件）。
 
 ---
 
