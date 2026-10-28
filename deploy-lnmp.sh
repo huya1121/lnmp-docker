@@ -1588,6 +1588,8 @@ _generate_docker_compose_nginx() {
       - ./volumes/nginx/ssl:/etc/nginx/ssl:ro
       - ./volumes/nginx/waf-guard.conf:/etc/nginx/waf-guard.conf:ro
       - ./volumes/php/www:/var/www/html:ro
+      # fail2ban 面板静态文件: nginx 的 try_files/index 需在本容器内看到它
+      - ./fail2ban-panel:/var/www/html/_f2bapp:ro
       - ./certbot/conf:/etc/letsencrypt:ro
       - ./certbot/www:/var/www/certbot:ro
       # 把 access/error 日志落到宿主机，供宿主机上的 fail2ban 读取
@@ -1628,6 +1630,8 @@ EOFNGINXSVC
     volumes:
       - ./volumes/nginx/config:/config
       - ./volumes/php/www:/var/www/html:ro
+      # fail2ban 面板静态文件: nginx 的 try_files/index 需在本容器内看到它
+      - ./fail2ban-panel:/var/www/html/_f2bapp:ro
       - ./certbot/conf:/etc/letsencrypt:ro
       - ./certbot/www:/var/www/certbot:ro
     depends_on:
@@ -1665,6 +1669,8 @@ EOFNGINXSVC
       - ./volumes/nginx/ssl:/etc/nginx/ssl:ro
       - ./volumes/nginx/waf-guard.conf:/etc/nginx/waf-guard.conf:ro
       - ./volumes/php/www:/var/www/html:ro
+      # fail2ban 面板静态文件: nginx 的 try_files/index 需在本容器内看到它
+      - ./fail2ban-panel:/var/www/html/_f2bapp:ro
       - ./certbot/conf:/etc/letsencrypt:ro
       - ./certbot/www:/var/www/certbot:ro
       # 把 access/error 日志落到宿主机，供宿主机上的 fail2ban 读取
@@ -2422,6 +2428,12 @@ setup_fail2ban_config() {
     step "${ICON_LOCK} 配置 fail2ban (DOCKER-USER 链封禁)"
 
     local access_log; access_log=$(get_nginx_access_log)
+
+    # 确保日志文件存在：fail2ban 启动时若 logpath 不存在，会导致整个 jail
+    # 加载失败、服务 failed（表现为 "jail lnmp-nginx 不存在"）。nginx 首次
+    # 产生访问前该文件可能尚未生成，这里预先创建占位文件兜底。
+    mkdir -p "$(dirname "$access_log")"
+    [[ -f "$access_log" ]] || touch "$access_log"
 
     # --- 过滤器: 匹配本脚本自定义 log_format main 中状态码为 444/429/403 的行 ---
     # 格式: <ip> - <user> [time] "METHOD uri proto" status ...
@@ -5070,10 +5082,14 @@ run_full_install() {
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     echo -e "  ${ICON_GLOBE} ${BOLD}访问地址:${NC}"
-    echo -e "     https://$DOMAIN"
+    echo -e "     网站首页:     ${CYAN}https://$DOMAIN${NC}"
     for sub in "${SUBDOMAINS[@]}"; do
-        echo -e "     https://${sub}.${DOMAIN}"
+        echo -e "     子域名:       ${CYAN}https://${sub}.${DOMAIN}${NC}"
     done
+    echo -e "     解封面板:     ${CYAN}https://$DOMAIN/f2b/${NC}  ${DIM}(fail2ban 网页管理，凭据见下)${NC}"
+    if [[ "$INSTALL_PHPMYADMIN" == "yes" ]]; then
+        echo -e "     phpMyAdmin:   ${CYAN}http://$DOMAIN:8080${NC}"
+    fi
     echo ""
     echo -e "  ${ICON_DATABASE} ${BOLD}数据库:${NC}"
     echo -e "     主机: mysql (容器内)"
@@ -5099,6 +5115,29 @@ run_full_install() {
     _print_f2b_summary
     echo -e "${DIM}  详细说明请查看: $README_FILE${NC}"
     echo ""
+}
+
+# ======================== 交互式主菜单 ========================
+# 无参数运行时展示；选项复用已有的完整安装 / WAF 安装流程。
+show_main_menu() {
+    show_banner
+    echo -e "  ${BOLD}请选择要执行的操作:${NC}"
+    echo ""
+    echo -e "    ${CYAN}1)${NC} 安装 LNMP        ${DIM}完整安装向导 (Nginx + MySQL + PHP + Redis + SSL)${NC}"
+    echo -e "    ${CYAN}2)${NC} 安装 fail2ban    ${DIM}为现有部署启用 WAF + fail2ban + 网页解封面板${NC}"
+    echo ""
+    echo -e "    ${CYAN}0)${NC} 退出"
+    echo ""
+    echo -e "${DIM}  提示: 其它运维操作请用命令行参数，如 $0 --help${NC}"
+    echo ""
+    printf "${GREEN}  请输入选项 [0-2]: ${NC}"
+    local choice; IFS= read -r choice || choice=""
+    case "$choice" in
+        1) run_full_install ;;
+        2) cmd_setup_waf ;;
+        0|"") echo -e "${DIM}  已退出${NC}"; exit 0 ;;
+        *) error "无效选项: $choice" ;;
+    esac
 }
 
 # ======================== 主入口 ========================
@@ -5183,7 +5222,7 @@ main() {
             cmd_cleanup
             ;;
         "")
-            run_full_install
+            show_main_menu
             ;;
         *)
             error "未知选项: $1\n使用 --help 查看帮助"
