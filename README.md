@@ -8,7 +8,7 @@
 
 ---
 
-## ✨ 核心特性
+## 核心特性
 
 - **一键安装向导** — 交互式选择 PHP / 数据库 / Nginx 版本、域名、证书类型，全程自动。
 - **自动 HTTPS** — 集成 certbot，支持单域名证书与 DNS 通配符证书（Cloudflare / 阿里云 / DNSPod），并自动续期。
@@ -28,7 +28,7 @@
 
 ---
 
-## 📦 技术栈默认值
+## 技术栈默认值
 
 | 组件 | 默认 | 可选 |
 |------|------|------|
@@ -40,7 +40,7 @@
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
 > 要求：一台可联网的 Linux 服务器（脚本会自动安装 Docker 与 compose 插件），域名已解析到本机 IP，具备 root 权限。
 
@@ -59,7 +59,7 @@ sudo ./deploy.sh
 
 ---
 
-## 🗂 目录结构
+## 目录结构
 
 安装完成后生成于 `./lnmp/`：
 
@@ -79,11 +79,11 @@ lnmp/
 └── backups/                 # 定时备份输出
 ```
 
-> ℹ️ `docker-compose.yml` 不是手写文件，而是 `deploy.sh` 运行时根据你的选择生成的。要改配置，改向导选项或 `.env` 后运行 `./deploy.sh --reconfig`，而非直接编辑。
+> 注意：`docker-compose.yml` 不是手写文件，而是 `deploy.sh` 运行时根据你的选择生成的。要改配置，改向导选项或 `.env` 后运行 `./deploy.sh --reconfig`，而非直接编辑。
 
 ---
 
-## 🛠 常用命令
+## 常用命令
 
 ```bash
 # ---- 安装 / 证书 ----
@@ -130,7 +130,7 @@ lnmp/
 
 ---
 
-## 🗄 数据库操作速查
+## 数据库操作速查
 
 > root 密码见 `lnmp/.credentials`。MySQL 8.0 镜像请把 `mariadb` / `mariadb-dump` 换成 `mysql` / `mysqldump`。
 
@@ -152,7 +152,7 @@ docker compose exec mysql mariadb-dump -uroot -p dbname > backup.sql
 docker compose exec -T mysql mariadb -uroot -p dbname < backup.sql
 ```
 
-### ⚠️ 迁移到新环境的注意事项
+### 迁移到新环境的注意事项
 
 自动备份使用 `--all-databases`，其中包含 `mysql` 系统库（账号权限表）。**整库导入新环境会覆盖新环境的 root 密码**，导致与 `.credentials` 不一致、登录失败。
 
@@ -160,7 +160,7 @@ docker compose exec -T mysql mariadb -uroot -p dbname < backup.sql
 
 ---
 
-## 🔒 安全模型（解封面板）
+## 安全模型（解封面板）
 
 网页解封面板遵循权限隔离设计：
 
@@ -172,6 +172,6 @@ docker compose exec -T mysql mariadb -uroot -p dbname < backup.sql
 
 ---
 
-## 📄 License
+## License
 
 按仓库 LICENSE 文件约定。
