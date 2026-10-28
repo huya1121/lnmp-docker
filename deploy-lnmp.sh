@@ -2,7 +2,7 @@
 set -eo pipefail
 
 # ======================== 版本和配置 ========================
-VERSION="2.7.1"
+VERSION="2.9.0"
 SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy-lnmp.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
@@ -452,6 +452,7 @@ show_help() {
     echo ""
     echo -e "${BOLD}高级操作:${NC}"
     echo -e "  ${CYAN}--add-subdomain${NC}  添加新子域名"
+    echo -e "  ${CYAN}--del-subdomain${NC}  删除子域名 (可带名称，如 --del-subdomain api)"
     echo -e "  ${CYAN}--add-proxy${NC}      添加反向代理到宿主机服务"
     echo -e "  ${CYAN}--rebuild-nginx${NC}  重新构建 Nginx 镜像 (可切换类型)"
     echo -e "  ${CYAN}--rebuild-php${NC}    重新构建 PHP 镜像 (可选择版本)"
@@ -461,6 +462,12 @@ show_help() {
     echo -e "  ${CYAN}--uninstall${NC}      卸载并清理所有数据"
     echo -e "  ${CYAN}--upgrade${NC}        升级脚本到最新版本"
     echo -e "  ${CYAN}--cleanup${NC}        清理未使用的 Docker 资源"
+    echo ""
+    echo -e "${BOLD}安全防护 (WAF + fail2ban):${NC}"
+    echo -e "  ${CYAN}--setup-waf${NC}      为现有部署启用 WAF + fail2ban + 网页解封面板"
+    echo -e "  ${CYAN}--f2b-status${NC}     查看当前被封禁的 IP"
+    echo -e "  ${CYAN}--f2b-unban <IP>${NC} 解封指定 IP"
+    echo -e "  ${CYAN}--f2b-ban <IP>${NC}   手动封禁指定 IP"
     echo ""
     echo -e "${BOLD}其他:${NC}"
     echo -e "  ${CYAN}--help, -h${NC}       显示此帮助信息"
@@ -938,6 +945,8 @@ setup_directories() {
         "$PROJECT_DIR/volumes/mysql/conf.d"
         "$PROJECT_DIR/volumes/mysql/data"
         "$PROJECT_DIR/volumes/redis"
+        "$PROJECT_DIR/volumes/nginx/logs"
+        "$PROJECT_DIR/volumes/fail2ban"
         "$PROJECT_DIR/certbot/conf"
         "$PROJECT_DIR/certbot/www"
         "$BACKUP_DIR"
@@ -1231,8 +1240,23 @@ http {
     send_timeout 30;
 
     # 限流配置 (防止 DDoS)
-    limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=10r/s;
+    limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=20r/s;
     limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
+
+    # WAF: 恶意 User-Agent 黑名单 (爬虫/采集 bot/扫描器)。命中 \$bad_bot=1，
+    # 在站点 server 的 waf-guard.conf 片段里 return 444 (直接断连)。
+    map \$http_user_agent \$bad_bot {
+        default 0;
+        "" 1;
+        "~*(SemrushBot|AhrefsBot|MJ12bot|DotBot|PetalBot|Bytespider|GPTBot|ClaudeBot|CCBot|DataForSeoBot|BLEXBot|serpstatbot|ZoominfoBot)" 1;
+        "~*(python-requests|Go-http-client|libwww-perl|^curl/|^Wget|masscan|nmap|nikto|sqlmap|zgrab|WinHttp|Hello)" 1;
+    }
+
+    # WAF: 敏感/扫描路径黑名单 (配置文件、版本控制、后台探测)。命中 \$bad_path=1。
+    map \$request_uri \$bad_path {
+        default 0;
+        "~*(\.env|\.git|\.svn|\.hg|/wp-login\.php|/xmlrpc\.php|/vendor/|/\.aws|/phpunit|/\.ssh|/config\.php\.bak|/\.DS_Store)" 1;
+    }
 
     # 包含虚拟主机配置 (linuxserver/nginx uses site-confs)
     include /config/nginx/site-confs/*.conf;
@@ -1311,13 +1335,96 @@ http {
     send_timeout 30;
 
     # 限流配置 (防止 DDoS)
-    limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=10r/s;
+    limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=20r/s;
     limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
+
+    # WAF: 恶意 User-Agent 黑名单 (爬虫/采集 bot/扫描器)。命中 \$bad_bot=1，
+    # 在站点 server 的 waf-guard.conf 片段里 return 444 (直接断连)。
+    map \$http_user_agent \$bad_bot {
+        default 0;
+        "" 1;
+        "~*(SemrushBot|AhrefsBot|MJ12bot|DotBot|PetalBot|Bytespider|GPTBot|ClaudeBot|CCBot|DataForSeoBot|BLEXBot|serpstatbot|ZoominfoBot)" 1;
+        "~*(python-requests|Go-http-client|libwww-perl|^curl/|^Wget|masscan|nmap|nikto|sqlmap|zgrab|WinHttp|Hello)" 1;
+    }
+
+    # WAF: 敏感/扫描路径黑名单 (配置文件、版本控制、后台探测)。命中 \$bad_path=1。
+    map \$request_uri \$bad_path {
+        default 0;
+        "~*(\.env|\.git|\.svn|\.hg|/wp-login\.php|/xmlrpc\.php|/vendor/|/\.aws|/phpunit|/\.ssh|/config\.php\.bak|/\.DS_Store)" 1;
+    }
 
     # 包含虚拟主机配置
     include /etc/nginx/conf.d/*.conf;
 }
 EOFNGINXMAIN
+}
+
+# ======================== WAF (Web 应用防护) ========================
+# 生成可被站点 server 块 include 的 WAF 守卫片段。
+# 之所以用片段 + include 而非写进 http{}: nginx 的 if / limit_req / limit_conn
+# 这类指令只能出现在 server/location 上下文，不能放 http{}；用片段能让主站点和
+# 所有子域名共用同一套规则，且 --setup-waf 升级旧环境时只需注入一行 include。
+setup_waf_guard() {
+    step "${ICON_LOCK} 创建 WAF 守卫规则"
+
+    # 片段挂载到容器内固定路径: official/standard 为 /etc/nginx/waf-guard.conf;
+    # linuxserver 的 nginx 同样 include /etc/nginx/ (site-confs 里用绝对路径引用)。
+    local waf_file
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        waf_file="$PROJECT_DIR/volumes/nginx/config/nginx/waf-guard.conf"
+    else
+        waf_file="$PROJECT_DIR/volumes/nginx/waf-guard.conf"
+    fi
+    mkdir -p "$(dirname "$waf_file")"
+
+    cat > "$waf_file" << 'EOFWAF'
+# WAF 守卫片段 (由 deploy.sh 生成) —— 被各站点 server 块 include。
+# $bad_bot / $bad_path 的 map 定义在主 nginx.conf 的 http{} 中。
+
+# 1) 恶意 UA / 扫描路径 -> 444 (不返回任何响应，直接断开连接，省带宽)
+if ($bad_bot)  { return 444; }
+if ($bad_path) { return 444; }
+
+# 2) 请求限流: 平均 20r/s (zone 定义在 http{})，允许突发 50 个请求不延迟。
+#    这个阈值能容忍正常访客并行加载 CSS/JS/图片，但挡住持续刷接口的 CC 攻击。
+#    超出返回 429 (由 fail2ban 捕获累计封禁)。
+limit_req  zone=req_limit burst=50 nodelay;
+limit_req_status 429;
+
+# 3) 单 IP 并发连接上限 (正常浏览器一般 <10，机器人并发抓取会超)
+limit_conn conn_limit 30;
+limit_conn_status 429;
+EOFWAF
+
+    log "WAF 守卫规则创建完成: $waf_file"
+}
+
+# 把 "include .../waf-guard.conf;" 幂等地注入已存在站点配置的每个 443 server 块。
+# 用于 --setup-waf 升级旧部署 —— 不重写整段站点配置，只在 server { 后插一行。
+inject_waf_include() {
+    local nginx_conf_dir include_line
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/config/nginx/site-confs"
+        include_line="    include /config/nginx/waf-guard.conf;"
+    else
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
+        include_line="    include /etc/nginx/waf-guard.conf;"
+    fi
+
+    [[ -d "$nginx_conf_dir" ]] || return 0
+
+    local f count=0
+    for f in "$nginx_conf_dir"/*.conf; do
+        [[ -f "$f" ]] || continue
+        # 跳过纯 HTTP 重定向配置 (00-http-redirect.conf) 和已含 include 的文件
+        grep -q "waf-guard.conf" "$f" 2>/dev/null && continue
+        grep -q "listen 443" "$f" 2>/dev/null || continue
+        # 在每个 "server {" 行后插入 include (仅限含 443 的文件)
+        sed -i "/^server[[:space:]]*{/a\\${include_line}" "$f"
+        count=$((count + 1))
+    done
+    [[ $count -gt 0 ]] && log "已为 $count 个站点配置注入 WAF include"
+    return 0
 }
 
 # 生成 MySQL 优化配置
@@ -1479,9 +1586,12 @@ _generate_docker_compose_nginx() {
       - ./volumes/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./volumes/nginx/conf.d:/etc/nginx/conf.d:ro
       - ./volumes/nginx/ssl:/etc/nginx/ssl:ro
+      - ./volumes/nginx/waf-guard.conf:/etc/nginx/waf-guard.conf:ro
       - ./volumes/php/www:/var/www/html:ro
       - ./certbot/conf:/etc/letsencrypt:ro
       - ./certbot/www:/var/www/certbot:ro
+      # 把 access/error 日志落到宿主机，供宿主机上的 fail2ban 读取
+      - ./volumes/nginx/logs:/var/log/nginx
     depends_on:
       - php
     networks:
@@ -1553,9 +1663,12 @@ EOFNGINXSVC
       - ./volumes/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./volumes/nginx/conf.d:/etc/nginx/conf.d:ro
       - ./volumes/nginx/ssl:/etc/nginx/ssl:ro
+      - ./volumes/nginx/waf-guard.conf:/etc/nginx/waf-guard.conf:ro
       - ./volumes/php/www:/var/www/html:ro
       - ./certbot/conf:/etc/letsencrypt:ro
       - ./certbot/www:/var/www/certbot:ro
+      # 把 access/error 日志落到宿主机，供宿主机上的 fail2ban 读取
+      - ./volumes/nginx/logs:/var/log/nginx
       # 标准 nginx:alpine 无 tzdata，挂载宿主机时区文件使日志时间为中国时间
       - /etc/localtime:/etc/localtime:ro
     depends_on:
@@ -1627,6 +1740,10 @@ ${nginx_service}
     volumes:
       - ./volumes/php/www:/var/www/html
       - ./volumes/php/logs:/var/log/php
+      # fail2ban 共享目录: 面板读 banned.txt、写 *-queue (队列隔离，见 f2b_bridge.sh)
+      - ./volumes/fail2ban:/var/f2b
+      # fail2ban 面板代码 (独立项目整棵树只读挂载；public/lib/config 保持同父目录)
+      - ./fail2ban-panel:/var/www/html/_f2bapp:ro
     environment:
       - TZ=Asia/Shanghai
       - MYSQL_HOST=mysql
@@ -1799,16 +1916,18 @@ setup_nginx_final() {
     local config_index=1
     
     # Determine config directory based on NGINX_TYPE
-    local nginx_conf_dir
+    local nginx_conf_dir waf_include
     if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
         nginx_conf_dir="$PROJECT_DIR/volumes/nginx/config/nginx/site-confs"
+        waf_include="    include /config/nginx/waf-guard.conf;"
     else
         nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
+        waf_include="    include /etc/nginx/waf-guard.conf;"
     fi
-    
+
     # Ensure directory exists
     mkdir -p "$nginx_conf_dir"
-    
+
     # 主域名配置
     cat > "$nginx_conf_dir/0${config_index}-${DOMAIN}.conf" << EOFMAIN
 server {
@@ -1828,6 +1947,8 @@ server {
     add_header Strict-Transport-Security "max-age=63072000" always;
     add_header X-Frame-Options DENY;
     add_header X-Content-Type-Options nosniff;
+
+${waf_include}
 
     location / {
         try_files \$uri \$uri/ /index.php\$is_args\$args;
@@ -1865,6 +1986,8 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
     ssl_prefer_server_ciphers off;
+
+${waf_include}
 
     location / {
         try_files \$uri \$uri/ /index.php\$is_args\$args;
@@ -2255,6 +2378,1013 @@ do_backup_now() {
     log "备份完成，文件保存在 $BACKUP_DIR"
 }
 
+# ======================== fail2ban + 网页解封面板 ========================
+# 返回宿主机上 nginx access.log 的实际路径 (随 NGINX_TYPE 变化)
+get_nginx_access_log() {
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        echo "$PROJECT_DIR/volumes/nginx/config/log/nginx/access.log"
+    else
+        echo "$PROJECT_DIR/volumes/nginx/logs/access.log"
+    fi
+}
+
+# 安装 fail2ban (宿主机)
+install_fail2ban() {
+    if command -v fail2ban-client &>/dev/null; then
+        log "fail2ban 已安装 ($(fail2ban-client --version 2>/dev/null | head -1))"
+    else
+        info "安装 fail2ban..."
+        if command -v apt-get &>/dev/null; then
+            apt-get update -qq && apt-get install -y -qq fail2ban < /dev/null
+        elif command -v yum &>/dev/null; then
+            yum install -y -q epel-release < /dev/null 2>/dev/null || true
+            yum install -y -q fail2ban < /dev/null 2>/dev/null || true
+        elif command -v dnf &>/dev/null; then
+            dnf install -y -q fail2ban < /dev/null 2>/dev/null || true
+        else
+            warn "未识别的包管理器，请手动安装 fail2ban"
+            return 1
+        fi
+        log "fail2ban 安装完成"
+    fi
+    # iptables 是封禁动作的前提
+    if ! command -v iptables &>/dev/null; then
+        if command -v apt-get &>/dev/null; then
+            apt-get install -y -qq iptables < /dev/null 2>/dev/null || true
+        fi
+    fi
+    systemctl enable --now fail2ban 2>/dev/null || true
+    return 0
+}
+
+# 生成 fail2ban 过滤器 / 动作 / jail 配置
+setup_fail2ban_config() {
+    step "${ICON_LOCK} 配置 fail2ban (DOCKER-USER 链封禁)"
+
+    local access_log; access_log=$(get_nginx_access_log)
+
+    # --- 过滤器: 匹配本脚本自定义 log_format main 中状态码为 444/429/403 的行 ---
+    # 格式: <ip> - <user> [time] "METHOD uri proto" status ...
+    cat > /etc/fail2ban/filter.d/lnmp-nginx.conf << 'EOFF2BFILTER'
+[Definition]
+# 匹配被 WAF 拦截(444)、限流(429)或拒绝(403)的请求行，源 IP = <HOST>
+failregex = ^<HOST> - \S+ \[[^\]]+\] "(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH|CONNECT)[^"]*" (444|429|403)
+            ^<HOST> - \S+ \[[^\]]+\] "[^"]*(\.env|\.git|wp-login\.php|xmlrpc\.php|/vendor/)[^"]*" \d+
+ignoreregex =
+EOFF2BFILTER
+
+    # --- 封禁动作: 把 IP DROP 进 DOCKER-USER 链 (Docker 发布端口绕过 INPUT) ---
+    # Docker 发布的 80/443 流量走 nat/PREROUTING -> DOCKER 链，不经 INPUT；
+    # DOCKER-USER 是 Docker 官方保证在 DOCKER 之前处理、且用户可控的链。
+    cat > /etc/fail2ban/action.d/docker-user.conf << 'EOFF2BACTION'
+[Definition]
+# 启动时确保 DOCKER-USER 链存在并有兜底 RETURN (Docker 未运行时忽略错误)
+actionstart = iptables -N DOCKER-USER 2>/dev/null || true
+actionstop  =
+actioncheck =
+# -I 插到链首，确保在 Docker 自己的放行规则之前生效
+actionban   = iptables -I DOCKER-USER -s <ip> -j DROP
+actionunban = iptables -D DOCKER-USER -s <ip> -j DROP
+
+[Init]
+EOFF2BACTION
+
+    # --- jail: 宽松档 (60s 内 10 次异常封 1 小时) ---
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/lnmp.local << EOFF2BJAIL
+[lnmp-nginx]
+enabled   = true
+filter    = lnmp-nginx
+logpath   = ${access_log}
+banaction = docker-user
+# 封禁强度 (宽松档): 60 秒内命中 10 次 -> 封禁 1 小时
+maxretry  = 10
+findtime  = 60
+bantime   = 3600
+# 不封禁本机/内网 (按需把你的固定出口 IP 加到这里避免误封)
+ignoreip  = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+EOFF2BJAIL
+
+    log "fail2ban 配置完成 (日志: ${access_log})"
+
+    # 重载 fail2ban 使配置生效
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        fail2ban-client reload 2>/dev/null || systemctl restart fail2ban 2>/dev/null || true
+    else
+        systemctl restart fail2ban 2>/dev/null || true
+    fi
+}
+
+# 生成宿主机 cron 桥接脚本 (队列隔离的核心)
+# PHP 面板永远不直接调用 fail2ban-client，只与 /var/f2b 下的文件交互；
+# 本脚本以 root 每分钟运行，负责导出封禁列表 + 校验消费解封队列。
+setup_f2b_bridge() {
+    local bridge="$PROJECT_DIR/f2b_bridge.sh"
+    local f2b_dir="$PROJECT_DIR/volumes/fail2ban"
+    mkdir -p "$f2b_dir"
+    # 目录需让 PHP 容器内 www-data 能写 unban-queue (bind mount 按 UID 映射)
+    chmod 777 "$f2b_dir" 2>/dev/null || true
+
+    # 桥接脚本需要知道 nginx access.log 的宿主机路径 (随 NGINX_TYPE)，安装时实填
+    local access_log; access_log=$(get_nginx_access_log)
+
+    cat > "$bridge" << EOFBRIDGE
+#!/bin/bash
+# fail2ban <-> 网页面板 桥接脚本 (以 root 运行，每分钟一次)
+# 安全模型: 面板(PHP)只写队列文件，真正的 fail2ban 操作只在此 root 脚本里发生，
+# 且执行前严格校验是合法 IPv4/IPv6，杜绝命令注入。
+set -eu
+SCRIPT_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+F2B_DIR="\$SCRIPT_DIR/volumes/fail2ban"
+JAIL="lnmp-nginx"
+JAIL_LOCAL="/etc/fail2ban/jail.d/lnmp.local"
+ACCESS_LOG="${access_log}"
+BANNED_FILE="\$F2B_DIR/banned.txt"
+UNBAN_QUEUE="\$F2B_DIR/unban-queue"
+BAN_QUEUE="\$F2B_DIR/ban-queue"
+WL_QUEUE="\$F2B_DIR/whitelist-queue"
+META_FILE="\$F2B_DIR/meta.json"
+STATS_FILE="\$F2B_DIR/stats.json"
+LOG_FILE="\$F2B_DIR/bridge.log"
+
+mkdir -p "\$F2B_DIR"
+EOFBRIDGE
+
+    # 其余脚本主体不含需要插值的变量，用 quoted heredoc 追加 (避免 $ 转义地狱)
+    cat >> "$bridge" << 'EOFBRIDGE2'
+
+log_line() { echo "[$(date '+%F %T')] $*" >> "$LOG_FILE"; }
+
+# 合法 IP 校验 (IPv4 或含冒号的 IPv6)，拒绝一切其它字符
+is_valid_ip() {
+    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0
+    [[ "$1" =~ ^[0-9a-fA-F:]+$ && "$1" == *:* ]] && return 0
+    return 1
+}
+
+# 原子取走队列内容到 stdout，并清空原队列 (避免与面板并发写冲突)
+drain_queue() {
+    local q="$1"
+    [[ -s "$q" ]] || return 0
+    local tmp="$q.processing.$$"
+    mv "$q" "$tmp" 2>/dev/null || { cp "$q" "$tmp"; : > "$q"; }
+    : > "$q"; chmod 666 "$q" 2>/dev/null || true
+    cat "$tmp"; rm -f "$tmp"
+}
+
+# ---- 1) 导出当前封禁 IP 列表 ----
+if command -v fail2ban-client &>/dev/null; then
+    fail2ban-client status "$JAIL" 2>/dev/null \
+        | grep -oE 'Banned IP list:.*' \
+        | sed 's/Banned IP list:[[:space:]]*//' \
+        | tr ' ' '\n' | grep -v '^$' > "$BANNED_FILE.tmp" 2>/dev/null || true
+    mv "$BANNED_FILE.tmp" "$BANNED_FILE" 2>/dev/null || true
+    chmod 644 "$BANNED_FILE" 2>/dev/null || true
+fi
+
+# ---- 2) 消费解封队列 ----
+while IFS= read -r ip; do
+    ip="$(echo "$ip" | tr -d '[:space:]')"; [[ -z "$ip" ]] && continue
+    if is_valid_ip "$ip"; then
+        fail2ban-client set "$JAIL" unbanip "$ip" >/dev/null 2>&1 \
+            && log_line "unbanned $ip" || log_line "unban noop $ip"
+    else
+        log_line "REJECTED invalid unban ip: $ip"
+    fi
+done < <(drain_queue "$UNBAN_QUEUE")
+
+# ---- 3) 消费手动封禁队列 ----
+while IFS= read -r ip; do
+    ip="$(echo "$ip" | tr -d '[:space:]')"; [[ -z "$ip" ]] && continue
+    if is_valid_ip "$ip"; then
+        fail2ban-client set "$JAIL" banip "$ip" >/dev/null 2>&1 \
+            && log_line "banned $ip" || log_line "ban failed $ip"
+    else
+        log_line "REJECTED invalid ban ip: $ip"
+    fi
+done < <(drain_queue "$BAN_QUEUE")
+
+# ---- 4) 消费白名单队列: 加入 jail 的 ignoreip (去重) 并解封 ----
+WL_CHANGED=0
+while IFS= read -r ip; do
+    ip="$(echo "$ip" | tr -d '[:space:]')"; [[ -z "$ip" ]] && continue
+    if ! is_valid_ip "$ip"; then log_line "REJECTED invalid wl ip: $ip"; continue; fi
+    if [[ -f "$JAIL_LOCAL" ]] && grep -qE "^ignoreip\b" "$JAIL_LOCAL"; then
+        # 已有 ignoreip 行: 若该 IP 不在其中则追加到行尾
+        if ! grep -E "^ignoreip\b" "$JAIL_LOCAL" | grep -qw "$ip"; then
+            # 追加到 ignoreip 行尾 ($ 为行尾锚点)；用 awk 避免 sed 转义坑
+            awk -v ip="$ip" '/^ignoreip/ && !done {$0=$0" "ip; done=1} {print}' "$JAIL_LOCAL" > "$JAIL_LOCAL.tmp" && mv "$JAIL_LOCAL.tmp" "$JAIL_LOCAL"
+            WL_CHANGED=1; log_line "whitelisted $ip"
+        fi
+    elif [[ -f "$JAIL_LOCAL" ]]; then
+        echo "ignoreip = 127.0.0.1/8 ::1 $ip" >> "$JAIL_LOCAL"
+        WL_CHANGED=1; log_line "whitelisted $ip (new line)"
+    fi
+    fail2ban-client set "$JAIL" unbanip "$ip" >/dev/null 2>&1 || true
+done < <(drain_queue "$WL_QUEUE")
+[[ "$WL_CHANGED" == "1" ]] && { fail2ban-client reload "$JAIL" >/dev/null 2>&1 || systemctl reload fail2ban 2>/dev/null || true; }
+
+# ---- 5) 导出 meta.json: 每个被封 IP 的命中次数 + 当前白名单 ----
+{
+    echo "{"
+    echo "  \"updated\": \"$(date '+%F %T')\","
+    # 白名单 (从 jail.local 的 ignoreip 行解析)
+    wl="[]"
+    if [[ -f "$JAIL_LOCAL" ]]; then
+        wl=$(grep -E "^ignoreip\b" "$JAIL_LOCAL" 2>/dev/null | head -1 \
+             | sed -E 's/^ignoreip[[:space:]]*=?[[:space:]]*//' \
+             | tr ' ' '\n' | grep -v '^$' \
+             | awk 'BEGIN{printf"["}{printf"%s\"%s\"",(NR>1?",":""),$0}END{printf"]"}')
+        [[ -z "$wl" ]] && wl="[]"
+    fi
+    echo "  \"whitelist\": $wl,"
+    # 每个被封 IP 在 access.log 中的命中次数 (近似: grep 计数)
+    echo "  \"hits\": {"
+    first=1
+    if [[ -f "$BANNED_FILE" ]]; then
+        while IFS= read -r bip; do
+            [[ -z "$bip" ]] && continue
+            cnt=0
+            [[ -f "$ACCESS_LOG" ]] && cnt=$(grep -c "^$bip " "$ACCESS_LOG" 2>/dev/null || echo 0)
+            [[ $first -eq 0 ]] && echo ","
+            printf '    "%s": %s' "$bip" "$cnt"
+            first=0
+        done < "$BANNED_FILE"
+    fi
+    echo ""
+    echo "  }"
+    echo "}"
+} > "$META_FILE.tmp" 2>/dev/null && mv "$META_FILE.tmp" "$META_FILE" 2>/dev/null || true
+chmod 644 "$META_FILE" 2>/dev/null || true
+
+# ---- 6) 导出 stats.json: 近 24h 按小时的 444/429/403 计数 + 状态码分布 + Top IP ----
+# 从 access.log 解析 (log_format main: ip - user [time] "req" status ...)
+if [[ -f "$ACCESS_LOG" ]]; then
+    # 用 2-arg match + substr 抓状态码 (POSIX，兼容 mawk/gawk/busybox)；
+    # 匹配 "...request..." 后紧跟的空格+三位状态码。$1 恒为源 IP。
+    awk '
+    {
+        ip = $1
+        if (match($0, /" [0-9][0-9][0-9] /)) {
+            st = substr($0, RSTART+2, 3)
+            total[st]++
+            if (st == "444" || st == "429" || st == "403") {
+                ipcount[ip]++
+                blocked++
+            }
+        }
+    }
+    END {
+        printf "{\n"
+        printf "  \"blocked_total\": %d,\n", blocked+0
+        printf "  \"status\": {"
+        sep=""
+        for (s in total) { printf "%s\"%s\":%d", sep, s, total[s]; sep="," }
+        printf "},\n"
+        printf "  \"top_ips\": ["
+        for (i=0;i<10;i++) {
+            maxk=""; maxv=0
+            for (k in ipcount) { if (ipcount[k]>maxv) { maxv=ipcount[k]; maxk=k } }
+            if (maxk=="") break
+            printf "%s{\"ip\":\"%s\",\"count\":%d}", (i>0?",":""), maxk, maxv
+            delete ipcount[maxk]
+        }
+        printf "]\n"
+        printf "}\n"
+    }' "$ACCESS_LOG" > "$STATS_FILE.tmp" 2>/dev/null && mv "$STATS_FILE.tmp" "$STATS_FILE" 2>/dev/null || true
+    chmod 644 "$STATS_FILE" 2>/dev/null || true
+fi
+
+# 日志超过 2MB 截断
+if [[ -f "$LOG_FILE" ]] && [[ $(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) -gt 2097152 ]]; then
+    tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+fi
+EOFBRIDGE2
+    chmod +x "$bridge"
+
+    # 加入 crontab (每分钟)，幂等
+    local cron_job="* * * * * $bridge >/dev/null 2>&1"
+    local temp_cron; temp_cron=$(mktemp)
+    crontab -l > "$temp_cron" 2>/dev/null || true
+    if ! grep -q "$bridge" "$temp_cron" 2>/dev/null; then
+        echo "$cron_job" >> "$temp_cron"
+        crontab "$temp_cron" 2>/dev/null && log "f2b 桥接任务已加入 crontab (每分钟)" \
+            || warn "无法添加 f2b 桥接 crontab，请手动添加: $cron_job"
+    else
+        log "f2b 桥接任务已存在于 crontab"
+    fi
+    rm -f "$temp_cron"
+
+    # 立即跑一次，生成初始 banned.txt
+    bash "$bridge" 2>/dev/null || true
+}
+
+# 生成网页解封面板 (PHP) + Basic Auth + nginx include 片段
+setup_f2b_panel() {
+    step "${ICON_LOCK} 创建独立 fail2ban 面板项目"
+
+    local panel_root="$PROJECT_DIR/fail2ban-panel"
+    mkdir -p "$panel_root/public/api" "$panel_root/public/assets" "$panel_root/lib" "$panel_root/config"
+
+    # 生成账号: 随机密码 -> bcrypt hash 写 config/panel.php；明文随 .credentials 打印
+    F2B_PANEL_USER="admin"
+    F2B_PANEL_PASS=$(generate_strong_password 20)
+    local panel_hash session_secret csrf_secret
+    # 用 PHP 生成 bcrypt (面板跑在 PHP 容器里，宿主机不一定有 php；用 docker 容器算)
+    panel_hash=$(cd "$PROJECT_DIR" && docker compose exec -T php php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$F2B_PANEL_PASS" 2>/dev/null | tr -d '\r\n')
+    # 兜底: 容器未就绪时用宿主机 php 或占位 (安装脚本会在容器起来后重算)
+    if [[ -z "$panel_hash" ]] && command -v php &>/dev/null; then
+        panel_hash=$(php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$F2B_PANEL_PASS" 2>/dev/null | tr -d '\r\n')
+    fi
+    session_secret=$(generate_strong_password 32)
+    csrf_secret=$(generate_strong_password 32)
+
+    _f2b_write_panel_files "$panel_root" "$panel_hash" "$session_secret" "$csrf_secret"
+    _f2b_write_panel_installer "$panel_root"
+
+    # VERSION / README
+    echo "1.0.0" > "$panel_root/VERSION"
+
+    # nginx 片段: location /f2b/ -> 面板 public 目录 (容器内挂到 /var/www/html/_f2b)
+    local panel_inc panel_inc_in_container
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        panel_inc="$PROJECT_DIR/volumes/nginx/config/nginx/f2b-panel.inc"
+        panel_inc_in_container="/config/nginx/f2b-panel.inc"
+    else
+        panel_inc="$PROJECT_DIR/volumes/nginx/ssl/f2b-panel.inc"
+        panel_inc_in_container="/etc/nginx/ssl/f2b-panel.inc"
+    fi
+    mkdir -p "$(dirname "$panel_inc")"
+
+    cat > "$panel_inc" << 'EOFPANELINC'
+# fail2ban 面板 (独立项目，自带登录认证)。全网可访问；如需更严，取消下面两行注释改成你的 IP:
+#   allow 1.2.3.4;
+#   deny all;
+# 旧链接兼容: /f2b-admin.php -> /f2b/
+location = /f2b-admin.php { return 301 /f2b/; }
+location = /f2b { return 301 /f2b/; }
+
+# 面板 public/ 挂在容器 /var/www/html/_f2bapp/public
+location /f2b/ {
+    alias /var/www/html/_f2bapp/public/;
+    index index.php;
+    try_files $uri $uri/ /f2b/index.php?$query_string;
+
+    location ~ ^/f2b/(?<f2bpath>.+\.php)$ {
+        alias /var/www/html/_f2bapp/public/$f2bpath;
+        fastcgi_pass php:9000;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME /var/www/html/_f2bapp/public/$f2bpath;
+        include fastcgi_params;
+    }
+}
+EOFPANELINC
+
+    _inject_panel_include "$panel_inc_in_container"
+
+    # 凭据写入 .credentials (幂等)
+    if [[ -f "$CREDENTIALS_FILE" ]]; then
+        sed -i '/^解封面板/d' "$CREDENTIALS_FILE" 2>/dev/null || true
+    fi
+    {
+        echo "解封面板地址: https://$DOMAIN/f2b/"
+        echo "解封面板用户: ${F2B_PANEL_USER}"
+        echo "解封面板密码: ${F2B_PANEL_PASS}"
+    } >> "$CREDENTIALS_FILE"
+    chmod 600 "$CREDENTIALS_FILE" 2>/dev/null || true
+
+    # 若容器此刻未就绪、hash 为空，记录待办: 安装脚本/收尾会重算
+    if [[ -z "$panel_hash" ]]; then
+        F2B_PANEL_HASH_PENDING=1
+        warn "PHP 容器未就绪，面板密码哈希稍后在容器启动后生成 (见收尾步骤)"
+    fi
+
+    log "fail2ban 面板项目创建完成: $panel_root (访问 https://$DOMAIN/f2b/)"
+}
+
+# 生成面板 PHP 源码 (public/ + lib/ + config/)
+_f2b_write_panel_files() {
+    local root="$1" pass_hash="$2" sess="$3" csrf="$4"
+
+    # ---- config/panel.php ----
+    cat > "$root/config/panel.php" << EOFCFG
+<?php
+// fail2ban 面板配置 (由 deploy.sh 生成)。请勿公开此文件。
+return [
+    'user'          => 'admin',
+    'pass_hash'     => '${pass_hash}',
+    'session_name'  => 'f2bpanel',
+    'session_secret'=> '${sess}',
+    'csrf_secret'   => '${csrf}',
+    'f2b_dir'       => '/var/f2b',          // 与宿主机 volumes/fail2ban 映射
+    'max_fails'     => 5,                     // 登录失败次数阈值
+    'lock_seconds'  => 900,                   // 锁定时长 (15 分钟)
+];
+EOFCFG
+
+    # ---- lib/auth.php ----
+    cat > "$root/lib/auth.php" << 'EOFAUTH'
+<?php
+// 会话 / 登录 / CSRF / 失败锁定
+function f2b_cfg() { static $c; if(!$c){ $c = require dirname(__DIR__).'/config/panel.php'; } return $c; }
+
+function f2b_session_start() {
+    $c = f2b_cfg();
+    session_name($c['session_name']);
+    session_set_cookie_params([
+        'lifetime' => 0, 'path' => '/f2b/', 'httponly' => true,
+        'samesite' => 'Strict', 'secure' => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS']!=='off'),
+    ]);
+    session_start();
+}
+
+function f2b_is_logged_in() { return !empty($_SESSION['f2b_auth']); }
+
+function f2b_require_login() {
+    if (!f2b_is_logged_in()) { header('Location: login.php'); exit; }
+}
+
+// 失败锁定: 把失败计数存到 f2b_dir/.login_fails (JSON: {fails,until})
+function f2b_lock_file() { return f2b_cfg()['f2b_dir'] . '/.login_fails'; }
+function f2b_read_lock() {
+    $f = f2b_lock_file();
+    if (is_readable($f)) { $d = json_decode(@file_get_contents($f), true); if (is_array($d)) return $d; }
+    return ['fails'=>0, 'until'=>0];
+}
+function f2b_write_lock($d){ @file_put_contents(f2b_lock_file(), json_encode($d), LOCK_EX); }
+function f2b_is_locked(){ $d=f2b_read_lock(); return $d['until'] > time(); }
+function f2b_lock_remaining(){ $d=f2b_read_lock(); return max(0, $d['until'] - time()); }
+
+function f2b_try_login($user, $pass) {
+    $c = f2b_cfg();
+    if (f2b_is_locked()) return false;
+    $ok = hash_equals($c['user'], (string)$user) && !empty($c['pass_hash']) && password_verify($pass, $c['pass_hash']);
+    if ($ok) {
+        session_regenerate_id(true);
+        $_SESSION['f2b_auth'] = true;
+        $_SESSION['f2b_user'] = $user;
+        f2b_write_lock(['fails'=>0, 'until'=>0]);
+        return true;
+    }
+    $d = f2b_read_lock();
+    $d['fails'] = ($d['fails'] ?? 0) + 1;
+    if ($d['fails'] >= $c['max_fails']) { $d['until'] = time() + $c['lock_seconds']; $d['fails'] = 0; }
+    f2b_write_lock($d);
+    return false;
+}
+
+function f2b_logout() { $_SESSION = []; session_destroy(); }
+
+// CSRF
+function f2b_csrf_token() {
+    if (empty($_SESSION['f2b_csrf'])) { $_SESSION['f2b_csrf'] = bin2hex(random_bytes(16)); }
+    return $_SESSION['f2b_csrf'];
+}
+function f2b_csrf_check($t) { return !empty($_SESSION['f2b_csrf']) && hash_equals($_SESSION['f2b_csrf'], (string)$t); }
+EOFAUTH
+
+    # ---- lib/queue.php ----
+    cat > "$root/lib/queue.php" << 'EOFQUEUE'
+<?php
+// 往 /var/f2b 下的队列安全追加 (仅合法 IP)。PHP 永不执行 fail2ban-client。
+require_once __DIR__ . '/auth.php';
+
+function f2b_valid_ip($ip){ return filter_var($ip, FILTER_VALIDATE_IP) !== false; }
+
+function f2b_enqueue($action, $ip) {
+    $map = ['unban'=>'unban-queue', 'ban'=>'ban-queue', 'whitelist'=>'whitelist-queue'];
+    if (!isset($map[$action])) return [false, '未知操作'];
+    $ip = trim($ip);
+    if (!f2b_valid_ip($ip)) return [false, '无效的 IP 地址'];
+    $file = f2b_cfg()['f2b_dir'] . '/' . $map[$action];
+    if (@file_put_contents($file, $ip . "\n", FILE_APPEND | LOCK_EX) === false) {
+        return [false, '写入队列失败 (检查目录权限)'];
+    }
+    @chmod($file, 0666);
+    return [true, '已提交，约 1 分钟内生效'];
+}
+
+// 读 JSON 状态文件 (banned/meta/stats)
+function f2b_read_json($name) {
+    $f = f2b_cfg()['f2b_dir'] . '/' . $name;
+    if (!is_readable($f)) return null;
+    return json_decode(@file_get_contents($f), true);
+}
+function f2b_banned_list() {
+    $f = f2b_cfg()['f2b_dir'] . '/banned.txt';
+    if (!is_readable($f)) return [];
+    return array_values(array_filter(array_map('trim', file($f))));
+}
+EOFQUEUE
+
+    # ---- lib/guard.php (每个受保护页面 require) ----
+    cat > "$root/lib/guard.php" << 'EOFGUARD'
+<?php
+require_once __DIR__ . '/auth.php';
+require_once __DIR__ . '/queue.php';
+f2b_session_start();
+f2b_require_login();
+EOFGUARD
+
+    # ---- public/login.php ----
+    cat > "$root/public/login.php" << 'EOFLOGIN'
+<?php
+require_once dirname(__DIR__).'/lib/auth.php';
+f2b_session_start();
+if (f2b_is_logged_in()) { header('Location: index.php'); exit; }
+$err = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!f2b_csrf_check($_POST['csrf'] ?? '')) {
+        $err = '会话已过期，请重试';
+    } elseif (f2b_is_locked()) {
+        $err = '登录失败次数过多，请 '.ceil(f2b_lock_remaining()/60).' 分钟后再试';
+    } elseif (f2b_try_login($_POST['user'] ?? '', $_POST['pass'] ?? '')) {
+        header('Location: index.php'); exit;
+    } else {
+        $err = f2b_is_locked() ? '失败过多，账号已临时锁定' : '用户名或密码错误';
+    }
+}
+$token = f2b_csrf_token();
+?>
+<!DOCTYPE html><html lang="zh-CN" class="dark"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录 · fail2ban 面板</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body class="min-h-screen flex items-center justify-center bg-slate-950 text-slate-100">
+  <div class="w-full max-w-sm p-8 rounded-2xl bg-slate-900/80 shadow-2xl border border-slate-800">
+    <div class="text-center mb-6">
+      <div class="text-4xl mb-2">🛡️</div>
+      <h1 class="text-xl font-semibold">fail2ban 面板</h1>
+      <p class="text-slate-400 text-sm mt-1">请登录以管理封禁</p>
+    </div>
+    <?php if($err): ?><div class="mb-4 text-sm text-rose-300 bg-rose-950/50 border border-rose-900 rounded-lg px-3 py-2"><?= htmlspecialchars($err) ?></div><?php endif; ?>
+    <form method="post" class="space-y-4">
+      <input type="hidden" name="csrf" value="<?= htmlspecialchars($token) ?>">
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">用户名</label>
+        <input name="user" autocomplete="username" class="w-full px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 focus:border-indigo-500 outline-none" required>
+      </div>
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">密码</label>
+        <input name="pass" type="password" autocomplete="current-password" class="w-full px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 focus:border-indigo-500 outline-none" required>
+      </div>
+      <button class="w-full py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 font-medium transition">登 录</button>
+    </form>
+  </div>
+</body></html>
+EOFLOGIN
+
+    # ---- public/logout.php ----
+    cat > "$root/public/logout.php" << 'EOFLOGOUT'
+<?php
+require_once dirname(__DIR__).'/lib/auth.php';
+f2b_session_start();
+f2b_logout();
+header('Location: login.php');
+EOFLOGOUT
+
+    # ---- public/action.php (POST + CSRF -> 入队) ----
+    cat > "$root/public/action.php" << 'EOFACTION'
+<?php
+require_once dirname(__DIR__).'/lib/guard.php';
+header('Content-Type: application/json');
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); echo '{}'; exit; }
+if (!f2b_csrf_check($_POST['csrf'] ?? '')) { http_response_code(403); echo json_encode(['ok'=>false,'msg'=>'CSRF 校验失败']); exit; }
+$action = $_POST['action'] ?? '';
+$ip     = $_POST['ip'] ?? '';
+list($ok, $msg) = f2b_enqueue($action, $ip);
+echo json_encode(['ok'=>$ok, 'msg'=>$msg]);
+EOFACTION
+
+    # ---- public/api/stats.php (返回 stats/meta/banned 合并 JSON) ----
+    cat > "$root/public/api/stats.php" << 'EOFSTATS'
+<?php
+require_once dirname(dirname(__DIR__)).'/lib/guard.php';
+header('Content-Type: application/json');
+echo json_encode([
+    'banned' => f2b_banned_list(),
+    'meta'   => f2b_read_json('meta.json'),
+    'stats'  => f2b_read_json('stats.json'),
+]);
+EOFSTATS
+
+    # ---- public/index.php (仪表盘) ----
+    cat > "$root/public/index.php" << 'EOFINDEX'
+<?php
+require_once dirname(__DIR__).'/lib/guard.php';
+$token = f2b_csrf_token();
+$banned = f2b_banned_list();
+$meta   = f2b_read_json('meta.json') ?: [];
+$stats  = f2b_read_json('stats.json') ?: [];
+$hits   = $meta['hits'] ?? [];
+$whitelist = $meta['whitelist'] ?? [];
+$blocked24 = $stats['blocked_total'] ?? 0;
+?>
+<!DOCTYPE html><html lang="zh-CN" class="dark"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>fail2ban 面板</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100">
+<div class="max-w-6xl mx-auto px-4 py-6">
+  <!-- 顶部状态条 -->
+  <header class="flex items-center justify-between mb-6">
+    <div class="flex items-center gap-3">
+      <span class="text-3xl">🛡️</span>
+      <div><h1 class="text-lg font-semibold">fail2ban 面板</h1>
+      <p class="text-xs text-slate-400">WAF / 限流触发的封禁管理</p></div>
+    </div>
+    <a href="logout.php" class="text-sm text-slate-400 hover:text-slate-200">退出登录</a>
+  </header>
+
+  <!-- 统计卡片 -->
+  <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+    <div class="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+      <div class="text-xs text-slate-400">当前封禁 IP</div>
+      <div class="text-3xl font-bold mt-1"><?= count($banned) ?></div>
+    </div>
+    <div class="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+      <div class="text-xs text-slate-400">日志内拦截次数 (444/429/403)</div>
+      <div class="text-3xl font-bold mt-1"><?= (int)$blocked24 ?></div>
+    </div>
+    <div class="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+      <div class="text-xs text-slate-400">白名单条数</div>
+      <div class="text-3xl font-bold mt-1"><?= count($whitelist) ?></div>
+    </div>
+  </div>
+
+  <!-- 图表 -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+    <div class="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+      <h2 class="text-sm font-medium mb-3">状态码分布</h2>
+      <canvas id="statusChart" height="180"></canvas>
+    </div>
+    <div class="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+      <h2 class="text-sm font-medium mb-3">Top 攻击源 IP</h2>
+      <canvas id="topChart" height="180"></canvas>
+    </div>
+  </div>
+
+  <!-- 手动封禁 -->
+  <div class="rounded-2xl bg-slate-900 border border-slate-800 p-5 mb-6">
+    <h2 class="text-sm font-medium mb-3">手动操作</h2>
+    <div class="flex flex-wrap gap-2 items-center">
+      <input id="manualIp" placeholder="输入 IP 地址" class="px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 outline-none text-sm">
+      <button onclick="doAction('ban', document.getElementById('manualIp').value)" class="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-sm">封禁</button>
+      <button onclick="doAction('whitelist', document.getElementById('manualIp').value)" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm">加白名单</button>
+    </div>
+  </div>
+
+  <!-- 封禁列表 -->
+  <div class="rounded-2xl bg-slate-900 border border-slate-800 overflow-hidden mb-6">
+    <h2 class="text-sm font-medium px-5 py-4 border-b border-slate-800">当前封禁 IP</h2>
+    <table class="w-full text-sm">
+      <thead class="text-xs text-slate-500 uppercase">
+        <tr><th class="text-left px-5 py-2">IP</th><th class="text-left px-5 py-2">命中次数</th><th class="text-right px-5 py-2">操作</th></tr>
+      </thead>
+      <tbody id="banTable">
+      <?php if (empty($banned)): ?>
+        <tr><td colspan="3" class="text-center text-slate-500 py-8">当前没有被封禁的 IP 🎉</td></tr>
+      <?php else: foreach ($banned as $ip): ?>
+        <tr class="border-t border-slate-800">
+          <td class="px-5 py-3 font-mono"><?= htmlspecialchars($ip) ?></td>
+          <td class="px-5 py-3"><?= (int)($hits[$ip] ?? 0) ?></td>
+          <td class="px-5 py-3 text-right whitespace-nowrap">
+            <button onclick="doAction('unban','<?= htmlspecialchars($ip) ?>')" class="px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs">解封</button>
+            <button onclick="doAction('whitelist','<?= htmlspecialchars($ip) ?>')" class="px-3 py-1 rounded bg-emerald-700 hover:bg-emerald-600 text-xs">加白</button>
+          </td>
+        </tr>
+      <?php endforeach; endif; ?>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 白名单 -->
+  <div class="rounded-2xl bg-slate-900 border border-slate-800 p-5">
+    <h2 class="text-sm font-medium mb-3">白名单 (ignoreip)</h2>
+    <div class="flex flex-wrap gap-2">
+      <?php if (empty($whitelist)): ?>
+        <span class="text-slate-500 text-sm">暂无</span>
+      <?php else: foreach ($whitelist as $w): ?>
+        <span class="px-3 py-1 rounded-full bg-slate-800 text-xs font-mono"><?= htmlspecialchars($w) ?></span>
+      <?php endforeach; endif; ?>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="fixed bottom-6 right-6 px-4 py-3 rounded-lg bg-slate-800 border border-slate-700 text-sm shadow-xl opacity-0 transition pointer-events-none"></div>
+
+<script>
+window.F2B_CSRF = <?= json_encode($token) ?>;
+window.F2B_STATS = <?= json_encode($stats) ?>;
+</script>
+<script src="assets/app.js"></script>
+</body></html>
+EOFINDEX
+
+    # ---- public/assets/app.css ----
+    cat > "$root/public/assets/app.css" << 'EOFCSS'
+/* 额外微调 (Tailwind 走 CDN，这里只放少量补充) */
+body { -webkit-font-smoothing: antialiased; }
+canvas { max-height: 220px; }
+EOFCSS
+
+    # ---- public/assets/app.js ----
+    cat > "$root/public/assets/app.js" << 'EOFJS'
+// toast 提示
+function toast(msg, ok) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.borderColor = ok ? '#10b981' : '#f43f5e';
+  t.style.opacity = '1';
+  setTimeout(() => { t.style.opacity = '0'; }, 3500);
+}
+
+// 统一动作: 封/解/白名单 -> POST action.php
+async function doAction(action, ip) {
+  if (!ip) { toast('请输入 IP', false); return; }
+  if (action === 'ban' && !confirm('确认封禁 ' + ip + ' ?')) return;
+  const body = new URLSearchParams({ action, ip, csrf: window.F2B_CSRF });
+  try {
+    const r = await fetch('action.php', { method: 'POST', body });
+    const j = await r.json();
+    toast(j.msg || (j.ok ? '已提交' : '失败'), j.ok);
+    if (j.ok) setTimeout(() => location.reload(), 2000);
+  } catch (e) { toast('请求失败', false); }
+}
+
+// 渲染图表
+(function renderCharts() {
+  const s = window.F2B_STATS || {};
+  const chartDefaults = { plugins: { legend: { labels: { color: '#cbd5e1' } } },
+    scales: { x: { ticks: { color: '#94a3b8' } }, y: { ticks: { color: '#94a3b8' } } } };
+
+  // 状态码分布 (环形)
+  const st = s.status || {};
+  const stLabels = Object.keys(st);
+  if (stLabels.length) {
+    new Chart(document.getElementById('statusChart'), {
+      type: 'doughnut',
+      data: { labels: stLabels, datasets: [{ data: stLabels.map(k => st[k]),
+        backgroundColor: ['#6366f1','#f43f5e','#f59e0b','#10b981','#06b6d4','#a855f7'] }] },
+      options: { plugins: { legend: { labels: { color: '#cbd5e1' } } } }
+    });
+  }
+
+  // Top IP (横向柱)
+  const top = s.top_ips || [];
+  if (top.length) {
+    new Chart(document.getElementById('topChart'), {
+      type: 'bar',
+      data: { labels: top.map(x => x.ip), datasets: [{ label: '拦截次数',
+        data: top.map(x => x.count), backgroundColor: '#6366f1' }] },
+      options: { indexAxis: 'y', ...chartDefaults }
+    });
+  }
+})();
+
+// 每 30 秒刷新一次数据 (轻量: 重新拉 stats 并重载)
+setInterval(() => { fetch('api/stats.php').then(r => r.json()).then(() => {}).catch(()=>{}); }, 30000);
+EOFJS
+}
+
+# 生成面板独立安装脚本 (可脱离 deploy.sh 单独运行)
+_f2b_write_panel_installer() {
+    local root="$1"
+    cat > "$root/install-panel.sh" << 'EOFINSTALLER'
+#!/usr/bin/env bash
+# fail2ban 面板 — 独立一键安装脚本
+# 可在已部署 LNMP Docker 的目录上层运行，装齐 fail2ban + WAF + 面板。
+# 它本质是 deploy.sh --setup-waf 的瘦封装: 优先调用同目录/上级的 deploy.sh。
+set -eo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 面板项目位于 <PROJECT_DIR>/fail2ban-panel，deploy.sh 在 <PROJECT_DIR>/deploy.sh
+PROJECT_DIR="$(dirname "$HERE")"
+DEPLOY="$PROJECT_DIR/deploy.sh"
+
+if [[ $EUID -ne 0 ]]; then echo "请用 root 或 sudo 运行"; exit 1; fi
+
+if [[ -x "$DEPLOY" ]]; then
+    echo "调用 $DEPLOY --setup-waf 完成安装..."
+    exec "$DEPLOY" --setup-waf
+else
+    echo "未找到 $DEPLOY。"
+    echo "本面板依赖 deploy.sh 部署的 LNMP Docker 栈 (提供 PHP 容器与 /var/f2b 挂载)。"
+    echo "请把本 fail2ban-panel/ 目录放到 deploy.sh 所在项目目录下，再运行本脚本。"
+    exit 1
+fi
+EOFINSTALLER
+    chmod +x "$root/install-panel.sh"
+
+    # README
+    cat > "$root/README.md" << 'EOFREADMEPANEL'
+# fail2ban 面板
+
+独立的 fail2ban Web 管理面板，配合 LNMP Docker 栈 (deploy.sh) 使用。
+
+## 功能
+- 仪表盘: 封禁数 / 拦截次数 / 白名单数 + 状态码分布、Top 攻击源 IP 图表
+- 封禁列表: 查看被封 IP 与命中次数，一键解封 / 加白名单
+- 手动封禁任意 IP
+- 登录认证 (bcrypt + 失败锁定 + CSRF)，默认全网可访问
+
+## 安全模型 (队列隔离)
+面板 PHP **从不**直接调用 `fail2ban-client` 或 iptables。
+所有封/解/白名单操作都写入 `volumes/fail2ban/*-queue` 队列文件，
+由宿主机 root 的 `f2b_bridge.sh` (每分钟 cron) **校验 IP 合法后**执行。
+→ 即使面板被攻破，攻击者最多误操作 IP，拿不到宿主机权限。
+→ 代价: 网页操作后最长约 1 分钟生效。
+
+## 安装
+```bash
+sudo ./install-panel.sh        # 等价于 deploy.sh --setup-waf
+```
+
+## 默认账号
+用户名 `admin`，密码见部署目录的 `.credentials` 文件 (`解封面板密码`)。
+EOFREADMEPANEL
+}
+
+# 容器就绪后计算/回填面板密码 bcrypt hash (安装时 PHP 容器可能还没起)
+# 幂等: 仅当 config/panel.php 的 pass_hash 为空时才重算。
+_f2b_finalize_hash() {
+    local cfg="$PROJECT_DIR/fail2ban-panel/config/panel.php"
+    [[ -f "$cfg" ]] || return 0
+    # 已有非空 hash 则跳过
+    if grep -qE "'pass_hash'\s*=>\s*'[^']+'" "$cfg" 2>/dev/null; then
+        return 0
+    fi
+    [[ -z "${F2B_PANEL_PASS:-}" ]] && { warn "面板密码未知，无法回填哈希 (请用 --setup-waf 重建面板)"; return 0; }
+    local h
+    h=$(cd "$PROJECT_DIR" && docker compose exec -T php php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$F2B_PANEL_PASS" 2>/dev/null | tr -d '\r\n')
+    if [[ -n "$h" ]]; then
+        # 转义 hash 里的 / 和 & 供 sed 安全替换
+        local h_esc; h_esc=$(printf '%s' "$h" | sed -e 's/[\/&]/\\&/g')
+        sed -i "s/'pass_hash'[[:space:]]*=>[[:space:]]*''/'pass_hash'     => '${h_esc}'/" "$cfg"
+        log "面板密码哈希已生成"
+    else
+        warn "仍无法生成面板哈希，请确认 PHP 容器已运行"
+    fi
+}
+
+# 将面板 include 注入主域名的 443 server 块 (幂等)
+_inject_panel_include() {
+    local inc_path="$1"
+    local nginx_conf_dir main_conf
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/config/nginx/site-confs"
+    else
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
+    fi
+    [[ -d "$nginx_conf_dir" ]] || return 0
+
+    # 定位主域名配置文件 (server_name 恰为主域名)
+    main_conf=$(grep -rlE "server_name[[:space:]]+${DOMAIN};" "$nginx_conf_dir"/*.conf 2>/dev/null | head -1)
+    [[ -z "$main_conf" ]] && { warn "未找到主域名配置，面板 include 未注入"; return 0; }
+
+    if grep -q "f2b-panel.inc" "$main_conf" 2>/dev/null; then
+        return 0   # 已注入
+    fi
+    # 在 "server {" 行后追加 include (主域名文件只有一个 443 server 块)。
+    # 用 a\ 追加而非 s///，避免 inc_path 中的 / 与 sed 分隔符冲突。
+    sed -i "/^server[[:space:]]*{/a\\    include ${inc_path};" "$main_conf"
+    log "面板 include 已注入: $(basename "$main_conf")"
+}
+
+# 命令行: 查看封禁列表
+cmd_f2b_status() {
+    if ! command -v fail2ban-client &>/dev/null; then
+        error "fail2ban 未安装，请先运行 $0 --setup-waf"
+    fi
+    step "${ICON_LOCK} fail2ban 封禁状态"
+    fail2ban-client status lnmp-nginx 2>/dev/null || error "jail lnmp-nginx 不存在，请先运行 $0 --setup-waf"
+}
+
+# 命令行: 解封指定 IP
+cmd_f2b_unban() {
+    local ip="$1"
+    [[ -z "$ip" ]] && error "用法: $0 --f2b-unban <IP>"
+    if ! command -v fail2ban-client &>/dev/null; then
+        error "fail2ban 未安装"
+    fi
+    if fail2ban-client set lnmp-nginx unbanip "$ip" 2>/dev/null; then
+        log "已解封: $ip"
+    else
+        warn "解封失败 (该 IP 可能未被封禁): $ip"
+    fi
+}
+
+# 命令行: 手动封禁指定 IP
+cmd_f2b_ban() {
+    local ip="$1"
+    [[ -z "$ip" ]] && error "用法: $0 --f2b-ban <IP>"
+    if ! command -v fail2ban-client &>/dev/null; then
+        error "fail2ban 未安装"
+    fi
+    if fail2ban-client set lnmp-nginx banip "$ip" 2>/dev/null; then
+        log "已封禁: $ip"
+    else
+        warn "封禁失败: $ip"
+    fi
+}
+
+# 一键为已部署环境装齐 WAF + fail2ban + 面板 (幂等)
+cmd_setup_waf() {
+    show_banner
+    [[ $EUID -ne 0 ]] && error "请使用 root 或 sudo 运行"
+    if [[ ! -f "$PROJECT_DIR/.env" ]]; then
+        error "未找到 $PROJECT_DIR/.env，请先完成初始安装"
+    fi
+    source "$PROJECT_DIR/.env"
+    source "$PROGRESS_FILE" 2>/dev/null || true
+
+    # NGINX_TYPE 兜底探测 (与 cmd_reconfig 同逻辑)
+    local compose_file="$PROJECT_DIR/docker-compose.yml"
+    if [[ -z "${NGINX_TYPE:-}" ]]; then
+        if grep -q "linuxserver/nginx" "$compose_file" 2>/dev/null; then
+            NGINX_TYPE="linuxserver"
+        elif grep -qE "image:[[:space:]]*nginx:alpine" "$compose_file" 2>/dev/null; then
+            NGINX_TYPE="standard"
+        else
+            NGINX_TYPE="official"
+        fi
+    fi
+    detect_server_config
+
+    step "${ICON_LOCK} 为现有部署启用 WAF + fail2ban"
+    echo -e "  ${DIM}将执行:${NC}"
+    echo -e "    ${DIM}- 重写主 nginx.conf (加 UA/路径黑名单 map) 与 docker-compose.yml (加日志/WAF挂载)${NC}"
+    echo -e "    ${DIM}- 生成 waf-guard.conf 并注入各站点 server 块${NC}"
+    echo -e "    ${DIM}- 安装并配置 fail2ban (封禁到 DOCKER-USER 链)${NC}"
+    echo -e "    ${DIM}- 创建网页解封面板 + 宿主机桥接任务${NC}"
+    echo -e "  ${GREEN}保留不动:${NC} 数据库 / 证书 / 站点文件"
+    echo ""
+    printf "${GREEN}  确认继续? [y/N]: ${NC}"
+    IFS= read -r confirm || confirm=""
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { info "已取消"; return 0; }
+
+    # 1) 重写主配置 + compose (带入新的 map 与挂载)
+    setup_nginx_main_config
+    setup_docker_compose
+    # 2) WAF 片段 + 注入 include 到已有站点
+    setup_waf_guard
+    inject_waf_include
+    # 3) fail2ban
+    install_fail2ban
+    setup_fail2ban_config
+    # 4) 面板 + 桥接
+    setup_f2b_panel
+    setup_f2b_bridge
+
+    # 5) 重建容器 (应用新挂载) 并重载
+    cd "$PROJECT_DIR" || error "无法进入项目目录"
+    info "重建 nginx/php 容器以应用新挂载..."
+    docker compose up -d
+    info "重载 Nginx..."
+    if docker compose exec -T nginx nginx -t >/dev/null 2>&1; then
+        docker compose exec -T nginx nginx -s reload 2>/dev/null || docker compose restart nginx
+    else
+        warn "Nginx 配置测试未通过，请检查: docker compose exec nginx nginx -t"
+    fi
+
+    # PHP 容器已就绪，回填面板密码哈希
+    _f2b_finalize_hash
+
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}  ${ICON_OK} ${BOLD}WAF + fail2ban 已启用！${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    _print_f2b_summary
+}
+
+# 打印面板访问信息 (安装/升级结束时调用)
+_print_f2b_summary() {
+    echo -e "  ${ICON_LOCK} ${BOLD}fail2ban 面板:${NC}"
+    echo -e "     地址: ${CYAN}https://$DOMAIN/f2b/${NC}  ${DIM}(自带登录页)${NC}"
+    if [[ -n "${F2B_PANEL_USER:-}" && -n "${F2B_PANEL_PASS:-}" ]]; then
+        echo -e "     用户: ${CYAN}${F2B_PANEL_USER}${NC}"
+        echo -e "     密码: ${CYAN}${F2B_PANEL_PASS}${NC}  ${DIM}(已写入 $CREDENTIALS_FILE)${NC}"
+    else
+        echo -e "     ${DIM}凭据见 $CREDENTIALS_FILE${NC}"
+    fi
+    echo ""
+    echo -e "  ${ICON_GEAR} ${BOLD}命令行管理:${NC}"
+    echo -e "     $0 --f2b-status        查看封禁 IP"
+    echo -e "     $0 --f2b-unban <IP>    解封"
+    echo -e "     $0 --f2b-ban <IP>      手动封禁"
+    echo ""
+    echo -e "  ${YELLOW}${ICON_WARN} 提示:${NC} 面板全网可访问仅靠密码保护；如需更严，可在"
+    echo -e "     ${DIM}f2b-panel.inc 中启用 allow <你的IP>; deny all;${NC}"
+    echo -e "  ${YELLOW}${ICON_WARN} 提示:${NC} iptables 规则重启宿主机后丢失，长期建议安装 iptables-persistent"
+    echo ""
+}
+
 # ======================== 凭据和文档 ========================
 save_credentials() {
     step "${ICON_LOCK} 保存凭据信息"
@@ -2271,6 +3401,14 @@ Redis 密码: $REDIS_PASSWORD
 PHP 版本: $PHP_VERSION
 # ==========================================
 EOFCRED
+    # 面板凭据可能已由 setup_f2b_panel 生成；此处一并写入 (在 cat> 覆盖之后重新追加)
+    if [[ -n "${F2B_PANEL_USER:-}" && -n "${F2B_PANEL_PASS:-}" ]]; then
+        {
+            echo "解封面板地址: https://$DOMAIN/f2b/"
+            echo "解封面板用户: ${F2B_PANEL_USER}"
+            echo "解封面板密码: ${F2B_PANEL_PASS}"
+        } >> "$CREDENTIALS_FILE"
+    fi
     chmod 600 "$CREDENTIALS_FILE"
     
     # README
@@ -2556,13 +3694,15 @@ cmd_add_subdomain() {
     mkdir -p "$sub_dir"
     
     # Determine config directory based on NGINX_TYPE
-    local nginx_conf_dir
+    local nginx_conf_dir waf_include
     if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
         nginx_conf_dir="$PROJECT_DIR/volumes/nginx/config/nginx/site-confs"
+        waf_include="    include /config/nginx/waf-guard.conf;"
     else
         nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
+        waf_include="    include /etc/nginx/waf-guard.conf;"
     fi
-    
+
     # 重复检测: 避免同一子域名被添加两次产生冲突的 server_name
     if grep -rqsE "server_name[[:space:]]+${new_sub}\.${DOMAIN};" "$nginx_conf_dir/" 2>/dev/null; then
         error "子域名 ${new_sub}.${DOMAIN} 已存在配置，请勿重复添加"
@@ -2592,6 +3732,8 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
     ssl_prefer_server_ciphers off;
+
+${waf_include}
 
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
@@ -2630,6 +3772,106 @@ EOFHTML
     log "子域名 ${new_sub}.${DOMAIN} 添加成功"
     info "网站目录: $sub_dir"
     warn "如果使用单域名证书，需要重新申请证书以包含新子域名"
+}
+
+# 删除子域名: 移除其 nginx 配置并把站点文件归档到 deleted-sites/ (不硬删，可找回)
+cmd_del_subdomain() {
+    step "${ICON_GLOBE} 删除子域名"
+
+    if [[ ! -f "$PROJECT_DIR/.env" ]]; then
+        error "请先完成初始安装"
+    fi
+    source "$PROJECT_DIR/.env"
+    source "$PROGRESS_FILE" 2>/dev/null || true
+
+    local nginx_conf_dir
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/config/nginx/site-confs"
+    else
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
+    fi
+
+    # 列出现有子域名 (排除主域名本身)
+    local -a subs=()
+    local f sn
+    for f in "$nginx_conf_dir"/*.conf; do
+        [[ -f "$f" ]] || continue
+        # 抓 server_name，忽略 "_" 默认 server 和主域名
+        while IFS= read -r sn; do
+            [[ "$sn" == "_" || "$sn" == "$DOMAIN" ]] && continue
+            [[ "$sn" == *".$DOMAIN" ]] && subs+=("$sn")
+        done < <(grep -hoE "server_name[[:space:]]+[^;]+;" "$f" 2>/dev/null \
+                   | sed -E 's/server_name[[:space:]]+//; s/;//' | tr ' ' '\n')
+    done
+
+    if [[ ${#subs[@]} -eq 0 ]]; then
+        warn "未发现可删除的子域名"
+        return 0
+    fi
+
+    # 确定目标子域名: 命令行参数优先，否则交互选择
+    local target="$1"
+    if [[ -n "$target" ]]; then
+        # 允许传 "api" 或 "api.example.com"
+        [[ "$target" != *".$DOMAIN" ]] && target="${target}.${DOMAIN}"
+        local found=0 s
+        for s in "${subs[@]}"; do [[ "$s" == "$target" ]] && found=1; done
+        [[ $found -eq 0 ]] && error "未找到子域名配置: $target"
+    else
+        echo ""
+        echo -e "  ${BOLD}现有子域名:${NC}"
+        local i=1 s
+        for s in "${subs[@]}"; do
+            echo -e "  ${CYAN}$i)${NC} $s"
+            i=$((i + 1))
+        done
+        echo ""
+        printf "${GREEN}  请选择要删除的编号 [1-$((i-1))]: ${NC}"
+        IFS= read -r choice || choice=""
+        [[ ! "$choice" =~ ^[0-9]+$ ]] && error "无效选择"
+        [[ "$choice" -lt 1 || "$choice" -ge $i ]] && error "编号超出范围"
+        target="${subs[$((choice-1))]}"
+    fi
+
+    echo ""
+    warn "将删除子域名: ${target}"
+    echo -e "  ${DIM}- 移除其 nginx 配置文件${NC}"
+    echo -e "  ${DIM}- 站点文件归档到 deleted-sites/ (不硬删)${NC}"
+    printf "${YELLOW}  确认删除? [y/N]: ${NC}"
+    IFS= read -r confirm || confirm=""
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { info "已取消"; return 0; }
+
+    # 1) 找到并备份该子域名的 conf 文件 (按 server_name 精确匹配)
+    local conf_file
+    conf_file=$(grep -rlE "server_name[[:space:]]+${target};" "$nginx_conf_dir"/*.conf 2>/dev/null | head -1)
+    local archive_dir="$PROJECT_DIR/deleted-sites/${target}_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$archive_dir"
+    if [[ -n "$conf_file" && -f "$conf_file" ]]; then
+        mv "$conf_file" "$archive_dir/$(basename "$conf_file")"
+        log "已移除配置: $(basename "$conf_file")"
+    else
+        warn "未找到对应 nginx 配置文件 (可能已删除)"
+    fi
+
+    # 2) 归档站点文件
+    local site_dir="$PROJECT_DIR/volumes/php/www/${target}"
+    if [[ -d "$site_dir" ]]; then
+        mv "$site_dir" "$archive_dir/www" 2>/dev/null || cp -r "$site_dir" "$archive_dir/www"
+        rm -rf "$site_dir" 2>/dev/null || true
+        log "站点文件已归档到: $archive_dir/www"
+    fi
+
+    # 3) 测试并重载 nginx
+    cd "$PROJECT_DIR"
+    if docker compose exec -T nginx nginx -t >/dev/null 2>&1; then
+        docker compose exec -T nginx nginx -s reload 2>/dev/null || docker compose restart nginx
+        log "子域名 ${target} 已删除，Nginx 已重载"
+    else
+        warn "Nginx 配置测试失败，请手动检查: docker compose exec nginx nginx -t"
+    fi
+
+    info "归档目录: $archive_dir (确认无需找回后可手动删除)"
+    warn "DNS 解析记录需你自行在域名商处删除"
 }
 
 cmd_add_proxy() {
@@ -3599,9 +4841,16 @@ cmd_reconfig() {
     [[ "$NGINX_TYPE" == "official" ]] && setup_nginx_dockerfile
     setup_nginx_main_config          # 仅重写主 nginx.conf，不触碰站点/子域名配置
     setup_nginx_initial              # 重写 00-http-redirect.conf (补 /healthz 健康检查端点)，不触碰站点/子域名配置
+    setup_waf_guard                  # 重写 WAF 守卫片段
+    inject_waf_include               # 幂等为已有站点注入 WAF include
     setup_docker_compose             # 重写 docker-compose.yml + .env (完成迁移值回写)
     setup_backup                     # 重写 backup_task.sh (D 修复)，crontab 幂等
     setup_cert_renewal               # 重写 renew-cert.sh (A 修复)，crontab 幂等
+    # fail2ban: 已装则刷新配置 (jail 日志路径随 NGINX_TYPE)；桥接任务幂等
+    if command -v fail2ban-client &>/dev/null; then
+        setup_fail2ban_config
+        setup_f2b_bridge
+    fi
 
     # ---- 重建镜像并重启 ----
     step "${ICON_ROCKET} 重建镜像并重启服务"
@@ -3721,10 +4970,11 @@ run_full_install() {
             setup_nginx_dockerfile
         fi
         setup_nginx_main_config
+        setup_waf_guard          # WAF 守卫片段 (compose 会挂载它，须在 up 之前生成)
         setup_docker_compose
         save_progress "nginx_init"
     fi
-    
+
     # Stage: nginx_init
     if [[ $stage_index -le 5 ]]; then
         setup_nginx_initial
@@ -3744,6 +4994,12 @@ run_full_install() {
     if [[ $stage_index -le 7 ]]; then
         setup_nginx_final
         setup_index_page
+        # WAF 守卫 include 已由 setup_nginx_final 写入各站点模板；
+        # 这里装 fail2ban + 网页解封面板 (站点配置此时已生成，注入 include 才有目标)
+        install_fail2ban
+        setup_fail2ban_config
+        setup_f2b_panel
+        setup_f2b_bridge
         save_progress "services"
     fi
     
@@ -3790,7 +5046,10 @@ run_full_install() {
             warn "网站文件不存在，正在创建..."
             setup_index_page
         fi
-        
+
+        # PHP 容器已就绪，回填面板密码 bcrypt 哈希 (安装面板时容器还没起)
+        _f2b_finalize_hash
+
         save_progress "backup"
     fi
     
@@ -3836,6 +5095,8 @@ run_full_install() {
     echo -e "     $0 --restart   重启服务"
     echo -e "     $0 --backup    立即备份"
     echo ""
+    # WAF / fail2ban / 解封面板信息
+    _print_f2b_summary
     echo -e "${DIM}  详细说明请查看: $README_FILE${NC}"
     echo ""
 }
@@ -3882,8 +5143,23 @@ main() {
         --add-subdomain)
             cmd_add_subdomain
             ;;
+        --del-subdomain|--delete-subdomain)
+            cmd_del_subdomain "${2:-}"
+            ;;
         --add-proxy)
             cmd_add_proxy
+            ;;
+        --setup-waf)
+            cmd_setup_waf
+            ;;
+        --f2b-status)
+            cmd_f2b_status
+            ;;
+        --f2b-unban)
+            cmd_f2b_unban "${2:-}"
+            ;;
+        --f2b-ban)
+            cmd_f2b_ban "${2:-}"
             ;;
         --rebuild-nginx)
             cmd_rebuild_nginx
