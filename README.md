@@ -8,7 +8,7 @@
 
 ---
 
-## 核心特性
+## ✨ 核心特性
 
 - **一键安装向导** — 交互式选择 PHP / 数据库 / Nginx 版本、域名、证书类型，全程自动。
 - **自动 HTTPS** — 集成 certbot，支持单域名证书与 DNS 通配符证书（Cloudflare / 阿里云 / DNSPod），并自动续期。
@@ -28,7 +28,7 @@
 
 ---
 
-## 技术栈默认值
+## 🧩 技术栈默认值
 
 | 组件 | 默认 | 可选 |
 |------|------|------|
@@ -40,7 +40,7 @@
 
 ---
 
-## 快速开始
+## 🚀 快速开始
 
 > 要求：一台可联网的 Linux 服务器（脚本会自动安装 Docker 与 compose 插件），域名已解析到本机 IP，具备 root 权限。
 
@@ -59,7 +59,7 @@ sudo ./deploy.sh
 
 ---
 
-## 目录结构
+## 📁 目录结构
 
 安装完成后生成于 `./lnmp/`：
 
@@ -83,7 +83,7 @@ lnmp/
 
 ---
 
-## 常用命令
+## ⌨️ 常用命令
 
 ```bash
 # ---- 安装 / 证书 ----
@@ -130,7 +130,7 @@ lnmp/
 
 ---
 
-## 数据库操作速查
+## 🗄️ 数据库操作速查
 
 > root 密码见 `lnmp/.credentials`。MySQL 8.0 镜像请把 `mariadb` / `mariadb-dump` 换成 `mysql` / `mysqldump`。
 
@@ -160,7 +160,7 @@ docker compose exec -T mysql mariadb -uroot -p dbname < backup.sql
 
 ---
 
-## 安全模型（解封面板）
+## 🛡️ 安全模型（解封面板）
 
 网页解封面板遵循权限隔离设计：
 
@@ -172,6 +172,34 @@ docker compose exec -T mysql mariadb -uroot -p dbname < backup.sql
 
 ---
 
-## License
+## 🤖 默认封禁的爬虫 / UA
+
+主 `nginx.conf` 的 `http{}` 里用 `map $http_user_agent $bad_bot` 维护一份黑名单，命中的请求在 `waf-guard.conf` 里直接返回 `444`（断连、不回包、省带宽）。匹配大小写不敏感。
+
+**国外 SEO / AI 采集类**
+`SemrushBot` `AhrefsBot` `MJ12bot` `DotBot` `PetalBot` `Bytespider` `GPTBot` `ClaudeBot` `CCBot` `DataForSeoBot` `BLEXBot` `serpstatbot` `ZoominfoBot`
+
+**中国采集 / SEO / 已停运搜索类**
+`YisouSpider`（神马搜索，注意见下）`EasouSpider` `EasouBot` `JikeSpider` `EtaoSpider` `YoudaoBot` `YYSpider` `MauiBot` `LinkpadBot` `Ezooms`
+
+**扫描器 / 异常客户端**
+空 UA · `python-requests` `Go-http-client` `libwww-perl` `curl/` `Wget` `masscan` `nmap` `nikto` `sqlmap` `zgrab` `WinHttp` `Hello`
+
+> **保留收录**：百度 `Baiduspider`、搜狗 `Sogou`、360 `360Spider` 等正规搜索引擎**未封**，不影响收录。
+>
+> **神马 `YisouSpider` 例外**：它本质是搜索引擎，封禁后神马搜索不会收录本站。这是按部署者要求显式加入的；如需放开收录，从黑名单移除即可。
+
+**增删方法**：编辑 `deploy.sh` 中 `map $http_user_agent $bad_bot` 的两处正则（official 与 linuxserver 各一份），用 `|` 分隔追加，然后 `./deploy.sh --reconfig` 重新生成并重载。
+
+验证：
+
+```bash
+curl -A "EasouSpider" -I https://你的域名/   # 被封：连接直接关闭
+curl -A "Baiduspider" -I https://你的域名/   # 未封：正常 200
+```
+
+---
+
+## 📄 License
 
 按仓库 LICENSE 文件约定。
