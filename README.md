@@ -46,7 +46,7 @@
 
 ```bash
 # 1. 下载脚本
-curl -fsSL -o deploy.sh https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy-lnmp.sh
+curl -fsSL -o deploy.sh https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy.sh
 chmod +x deploy.sh
 
 # 2. 运行完整安装向导（无参数即进入向导）
