@@ -3,9 +3,22 @@ set -eo pipefail
 
 # ======================== 版本和配置 ========================
 VERSION="2.10.0"
-SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy-lnmp.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
+# 脚本本身就在项目目录里 (安装时会复制一份到 lnmp/deploy.sh) 时，项目目录就是脚本所在目录，
+# 否则从 lnmp/deploy.sh 运行会去找 lnmp/lnmp，所有命令都找不到 .env。
+# 判断要严格: 必须同时有本脚本生成的 .env 和 compose 文件。只看 .env 的话，脚本放在 /root
+# 而 /root 恰好有别的程序的 .env 时，项目目录会变成 /root，--uninstall 会删掉整个 /root
+is_lnmp_project_dir() {
+    [[ -f "$1/.env" && -f "$1/docker-compose.yml" ]] \
+        && grep -q '^MYSQL_ROOT_PASS=' "$1/.env" 2>/dev/null \
+        && grep -q 'container_name: \${PROJECT_NAME}_nginx' "$1/docker-compose.yml" 2>/dev/null
+}
+# 用「lnmp/ 不是项目」而不是「lnmp/ 不存在」: 旧版本 bug 可能残留一个空的 lnmp/lnmp 目录
+if ! is_lnmp_project_dir "$PROJECT_DIR" && is_lnmp_project_dir "$SCRIPT_DIR"; then
+    PROJECT_DIR="$SCRIPT_DIR"
+fi
 PROJECT_NAME="lnmp"
 PHP_VERSION="8.2"
 MARIADB_VERSION="10.11"
@@ -22,6 +35,9 @@ SUBDOMAINS=()
 DOMAIN=""
 INSTALL_PHPMYADMIN="no"
 NGINX_TYPE="official"  # official (with geoip2 build) or linuxserver
+# Cloudflare 官方回源网段 (https://www.cloudflare.com/ips/)。nginx 只信任这些来源发来的
+# CF-Connecting-IP；fail2ban 白名单也包含它们，避免把 CF 节点当攻击者封掉。
+CF_IP_RANGES="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
 # 官方 Nginx 镜像基于 nginx:alpine (始终为最新稳定版)。GeoIP2 动态模块会在
 # 构建时自动探测该基础镜像的 nginx 版本并下载对应源码编译，
 # 因此无需在此固定版本号 —— 永远跟随最新 nginx。
@@ -420,11 +436,64 @@ save_progress() {
 }
 
 load_progress() { [[ -f "$PROGRESS_FILE" ]] && source "$PROGRESS_FILE" && return 0; return 1; }
+
+# 读取已有部署的配置，供 --reconfig / --setup-waf / --update-f2b-panel 等入口共用。
+# 1) NGINX_TYPE / INSTALL_PHPMYADMIN 脚本开头有默认值，旧版 .env 没有这两个键时 source 后
+#    仍是默认值，判断"是否为空"永远不成立 —— 必须先 unset，缺键时才能真正走探测。
+# 2) .env 里子域名存成 SUBDOMAINS_LIST 字符串，要还原回 SUBDOMAINS 数组，
+#    否则后面重写 .env 时会写成空，子域名记录永久丢失。
+load_existing_env() {
+    [[ -f "$PROJECT_DIR/.env" ]] || error "未找到 $PROJECT_DIR/.env，请先完成初始安装"
+    unset NGINX_TYPE INSTALL_PHPMYADMIN
+    source "$PROJECT_DIR/.env"
+    # 进度文件里只取这两个值；不整体 source —— 里面的域名、密码可能是另一次未完成安装的旧值，
+    # 会覆盖 .env 里正在使用的配置
+    if [[ -f "$PROGRESS_FILE" ]]; then
+        local pv
+        if [[ -z "${NGINX_TYPE:-}" ]]; then
+            pv=$(grep -m1 '^NGINX_TYPE=' "$PROGRESS_FILE" 2>/dev/null | cut -d= -f2-) || true
+            [[ "$pv" =~ ^(official|standard|linuxserver)$ ]] && NGINX_TYPE="$pv"
+        fi
+        if [[ -z "${INSTALL_PHPMYADMIN:-}" ]]; then
+            pv=$(grep -m1 '^INSTALL_PHPMYADMIN=' "$PROGRESS_FILE" 2>/dev/null | cut -d= -f2-) || true
+            [[ "$pv" =~ ^(yes|no)$ ]] && INSTALL_PHPMYADMIN="$pv"
+        fi
+    fi
+    local compose_file="$PROJECT_DIR/docker-compose.yml"
+    if [[ -z "${NGINX_TYPE:-}" ]]; then
+        if grep -q "linuxserver/nginx" "$compose_file" 2>/dev/null; then
+            NGINX_TYPE="linuxserver"
+        elif grep -qE "image:[[:space:]]*nginx:alpine" "$compose_file" 2>/dev/null; then
+            NGINX_TYPE="standard"
+        else
+            # 含 lnmp-nginx-geoip2 或 nginx 使用 build: 均视为 official；兜底也是 official
+            NGINX_TYPE="official"
+        fi
+        info "自动探测 NGINX_TYPE=$NGINX_TYPE"
+    fi
+    if [[ -z "${INSTALL_PHPMYADMIN:-}" ]]; then
+        if grep -q "phpmyadmin:" "$compose_file" 2>/dev/null; then
+            INSTALL_PHPMYADMIN="yes"
+        else
+            INSTALL_PHPMYADMIN="no"
+        fi
+        info "自动探测 INSTALL_PHPMYADMIN=$INSTALL_PHPMYADMIN"
+    fi
+    CERT_TYPE="${CERT_TYPE:-single}"
+    DNS_PROVIDER="${DNS_PROVIDER:-}"
+    # SUBDOMAINS_LIST 非空才覆盖，否则沿用进度文件恢复的 SUBDOMAINS
+    if [[ -n "${SUBDOMAINS_LIST:-}" ]]; then
+        read -r -a SUBDOMAINS <<< "$SUBDOMAINS_LIST"
+    fi
+    # 关键值缺失时不能继续，否则会写出空密码的 .env，redis 等服务起不来
+    [[ -n "${DOMAIN:-}" ]] || error ".env 中缺少 DOMAIN，无法继续"
+    [[ -n "${MYSQL_ROOT_PASS:-}" && -n "${REDIS_PASSWORD:-}" ]] || error ".env 中缺少数据库/Redis 密码，无法继续"
+}
 clear_progress() { rm -f "$PROGRESS_FILE"; }
 
 # ======================== 显示函数 ========================
 show_banner() {
-    clear
+    clear 2>/dev/null || true   # TERM 未设置 (如 cron / 非交互) 时 clear 返回非零，set -e 下会直接退出
     echo -e "${CYAN}"
     echo "    ██╗     ███╗   ██╗███╗   ███╗██████╗ "
     echo "    ██║     ████╗  ██║████╗ ████║██╔══██╗"
@@ -475,6 +544,7 @@ show_help() {
     echo -e "${BOLD}安全防护 (WAF + fail2ban):${NC}"
     echo -e "  ${CYAN}--setup-waf${NC}      为现有部署启用 WAF + fail2ban + 网页解封面板"
     echo -e "  ${CYAN}--reset-f2b-password${NC}  重置网页解封面板登录密码 (用户名固定 admin)"
+    echo -e "  ${CYAN}--update-f2b-panel${NC}    升级面板页面与 fail2ban 规则 (保留密码与封禁数据)"
     echo -e "  ${CYAN}--f2b-status${NC}     查看当前被封禁的 IP"
     echo -e "  ${CYAN}--f2b-unban <IP>${NC} 解封指定 IP"
     echo -e "  ${CYAN}--f2b-ban <IP>${NC}   手动封禁指定 IP"
@@ -1180,24 +1250,31 @@ setup_nginx_main_config() {
     local worker_connections=$(get_nginx_worker_connections)
     local client_body_buffer=$(get_nginx_client_body_buffer)
 
-    # Cloudflare 真实 IP 还原: 站点在 CF 后面时，$remote_addr 是 CF 边缘 IP，
-    # 会导致限流/日志/fail2ban 针对 CF 而非真实访客 (封 CF = 全站打不开)。
+    # Cloudflare 真实 IP 还原: 站点在 CF 后面时，$remote_addr 是 CF 节点 IP，
+    # 会导致限流/日志/fail2ban 针对 CF 而非真实访客 (封 CF 节点 = 大批正常访客打不开)。
     # 用 real_ip + CF-Connecting-IP 把 $remote_addr 还原为真实客户端。
-    # 仅当使用 Cloudflare DNS (通配符证书) 时注入，其它情况为空。
-    CF_REALIP_BLOCK=""
-    if [[ "${DNS_PROVIDER:-}" == "cloudflare" ]]; then
-        CF_REALIP_BLOCK=$'    # --- Cloudflare 真实客户端 IP 还原 ---\n'
-        local _cidr
-        for _cidr in 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 \
-                     141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 \
-                     197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 \
-                     104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 \
-                     2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 \
-                     2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32; do
-            CF_REALIP_BLOCK+="    set_real_ip_from ${_cidr};"$'\n'
-        done
-        CF_REALIP_BLOCK+=$'    real_ip_header CF-Connecting-IP;\n    real_ip_recursive on;\n'
+    # 始终开启，不再只限于 CF 通配符证书: 单域名证书 + 开 CF 代理同样需要。
+    # 安全: set_real_ip_from 只信任来自 CF 网段的连接发来的 CF-Connecting-IP，
+    # 直连服务器的客户端伪造这个头不会生效；没套 CF 时这些规则不会命中，无副作用。
+    CF_REALIP_BLOCK=$'    # --- Cloudflare 真实客户端 IP 还原 ---\n'
+    local _cidr
+    for _cidr in $CF_IP_RANGES; do
+        CF_REALIP_BLOCK+="    set_real_ip_from ${_cidr};"$'\n'
+    done
+    CF_REALIP_BLOCK+=$'    real_ip_header CF-Connecting-IP;\n    real_ip_recursive on;\n'
+
+    # fail2ban 封禁名单: 宿主机文件 volumes/nginx/f2b-banned.conf (linuxserver 在 config/nginx/ 下)，
+    # 必须先存在 (哪怕为空)，否则 nginx 启动时 include 找不到文件会直接报错
+    local banlist_host
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        F2B_NGINX_BANLIST="/config/nginx/f2b-banned.conf"
+        banlist_host="$PROJECT_DIR/volumes/nginx/config/nginx/f2b-banned.conf"
+    else
+        F2B_NGINX_BANLIST="/etc/nginx/f2b-banned.conf"
+        banlist_host="$PROJECT_DIR/volumes/nginx/f2b-banned.conf"
     fi
+    mkdir -p "$(dirname "$banlist_host")"
+    [[ -f "$banlist_host" ]] || : > "$banlist_host"
 
     if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
         # linuxserver/nginx uses /config/nginx/ for configuration
@@ -1241,13 +1318,17 @@ http {
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
 
-    log_format main '\$remote_addr - \$remote_user [\$time_local] "\$request" '
+    # 第二列固定写 "-"，不记 \$remote_user: 它来自客户端 Authorization 头，可塞入空格或伪造的
+    # [时间戳]，让 fail2ban 的正则或时间解析失效，从而永远不被封禁
+    log_format main '\$remote_addr - - [\$time_local] "\$request" '
                     '\$status \$body_bytes_sent "\$http_referer" '
                     '"\$http_user_agent" "\$http_x_forwarded_for" '
                     'rt=\$request_time uct="\$upstream_connect_time" '
                     'uht="\$upstream_header_time" urt="\$upstream_response_time"';
 
-    access_log /config/log/nginx/access.log main buffer=16k flush=2m;
+    # 已封禁 IP 的请求不写日志 (见下方 geo \$f2b_banned)：既减少日志量，
+    # 也避免被拦的请求又被 fail2ban 计数，导致封禁无限续期
+    access_log /config/log/nginx/access.log main buffer=16k flush=2m if=\$f2b_log;
 
     # 性能优化
     sendfile on;
@@ -1278,6 +1359,14 @@ http {
     send_timeout 30;
 
 ${CF_REALIP_BLOCK}
+    # fail2ban 封禁名单 (由 f2b_bridge.sh 每分钟同步)。按 \$remote_addr 匹配，
+    # 已经过上面的真实 IP 还原，所以站点走 Cloudflare 代理时也能拦住真实访客。
+    geo \$f2b_banned {
+        default 0;
+        include ${F2B_NGINX_BANLIST};
+    }
+    map \$f2b_banned \$f2b_log { 1 0; default 1; }
+
     # 限流配置 (防止 DDoS)
     limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=20r/s;
     limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
@@ -1290,7 +1379,9 @@ ${CF_REALIP_BLOCK}
         "~*(SemrushBot|AhrefsBot|MJ12bot|DotBot|PetalBot|Bytespider|GPTBot|ClaudeBot|CCBot|DataForSeoBot|BLEXBot|serpstatbot|ZoominfoBot|YisouSpider)" 1;
         # 中国采集/SEO/已停运搜索类爬虫 (不含百度/搜狗/360/神马 等正规搜索引擎，保留收录)
         "~*(EasouSpider|JikeSpider|EtaoSpider|YoudaoBot|MauiBot|EasouBot|YYSpider|LinkpadBot|Ezooms)" 1;
-        "~*(python-requests|Go-http-client|libwww-perl|^curl/|^Wget|masscan|nmap|nikto|sqlmap|zgrab|WinHttp|Hello)" 1;
+        # 只封扫描器。curl / wget / python-requests 等通用 HTTP 客户端不封:
+        # 监控、接口调用、运维脚本都在用，封了会误伤，且 fail2ban 会把来源 IP 一并封掉
+        "~*(masscan|nmap|nikto|sqlmap|zgrab)" 1;
     }
 
     # WAF: 敏感/扫描路径黑名单 (配置文件、版本控制、后台探测)。命中 \$bad_path=1。
@@ -1341,13 +1432,17 @@ http {
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
 
-    log_format main '\$remote_addr - \$remote_user [\$time_local] "\$request" '
+    # 第二列固定写 "-"，不记 \$remote_user: 它来自客户端 Authorization 头，可塞入空格或伪造的
+    # [时间戳]，让 fail2ban 的正则或时间解析失效，从而永远不被封禁
+    log_format main '\$remote_addr - - [\$time_local] "\$request" '
                     '\$status \$body_bytes_sent "\$http_referer" '
                     '"\$http_user_agent" "\$http_x_forwarded_for" '
                     'rt=\$request_time uct="\$upstream_connect_time" '
                     'uht="\$upstream_header_time" urt="\$upstream_response_time"';
 
-    access_log /var/log/nginx/access.log main buffer=16k flush=2m;
+    # 已封禁 IP 的请求不写日志 (见下方 geo \$f2b_banned)：既减少日志量，
+    # 也避免被拦的请求又被 fail2ban 计数，导致封禁无限续期
+    access_log /var/log/nginx/access.log main buffer=16k flush=2m if=\$f2b_log;
 
     # 性能优化
     sendfile on;
@@ -1378,6 +1473,14 @@ http {
     send_timeout 30;
 
 ${CF_REALIP_BLOCK}
+    # fail2ban 封禁名单 (由 f2b_bridge.sh 每分钟同步)。按 \$remote_addr 匹配，
+    # 已经过上面的真实 IP 还原，所以站点走 Cloudflare 代理时也能拦住真实访客。
+    geo \$f2b_banned {
+        default 0;
+        include ${F2B_NGINX_BANLIST};
+    }
+    map \$f2b_banned \$f2b_log { 1 0; default 1; }
+
     # 限流配置 (防止 DDoS)
     limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=20r/s;
     limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;
@@ -1390,7 +1493,9 @@ ${CF_REALIP_BLOCK}
         "~*(SemrushBot|AhrefsBot|MJ12bot|DotBot|PetalBot|Bytespider|GPTBot|ClaudeBot|CCBot|DataForSeoBot|BLEXBot|serpstatbot|ZoominfoBot|YisouSpider)" 1;
         # 中国采集/SEO/已停运搜索类爬虫 (不含百度/搜狗/360/神马 等正规搜索引擎，保留收录)
         "~*(EasouSpider|JikeSpider|EtaoSpider|YoudaoBot|MauiBot|EasouBot|YYSpider|LinkpadBot|Ezooms)" 1;
-        "~*(python-requests|Go-http-client|libwww-perl|^curl/|^Wget|masscan|nmap|nikto|sqlmap|zgrab|WinHttp|Hello)" 1;
+        # 只封扫描器。curl / wget / python-requests 等通用 HTTP 客户端不封:
+        # 监控、接口调用、运维脚本都在用，封了会误伤，且 fail2ban 会把来源 IP 一并封掉
+        "~*(masscan|nmap|nikto|sqlmap|zgrab)" 1;
     }
 
     # WAF: 敏感/扫描路径黑名单 (配置文件、版本控制、后台探测)。命中 \$bad_path=1。
@@ -1428,6 +1533,9 @@ setup_waf_guard() {
     cat > "$waf_file" << 'EOFWAF'
 # WAF 守卫片段 (由 deploy.sh 生成) —— 被各站点 server 块 include。
 # $bad_bot / $bad_path 的 map 定义在主 nginx.conf 的 http{} 中。
+
+# 0) fail2ban 已封禁的 IP -> 444。网站走 Cloudflare 时 iptables 拦不到真实访客，靠这一层兜住
+if ($f2b_banned) { return 444; }
 
 # 1) 恶意 UA / 扫描路径 -> 444 (不返回任何响应，直接断开连接，省带宽)
 if ($bad_bot)  { return 444; }
@@ -1597,12 +1705,12 @@ get_host_ip() {
     
     # 方法 2: 使用默认网关 (通用)
     if [[ -z "$host_ip" ]]; then
-        host_ip=$(ip route 2>/dev/null | grep default | awk '{print $3}' | head -1)
+        host_ip=$(ip route 2>/dev/null | grep default | awk '{print $3}' | head -1) || true
     fi
     
     # 方法 3: 尝试获取主机的第一个非 lo 接口 IP
     if [[ -z "$host_ip" ]]; then
-        host_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        host_ip=$(hostname -I 2>/dev/null | awk '{print $1}') || true
     fi
     
     # 备用: 使用标准 Docker 桥接网络网关
@@ -1634,6 +1742,7 @@ _generate_docker_compose_nginx() {
     ports:
       - "80:80"
       - "443:443"
+      - "443:443/udp"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -1641,6 +1750,8 @@ _generate_docker_compose_nginx() {
       - ./volumes/nginx/conf.d:/etc/nginx/conf.d:ro
       - ./volumes/nginx/ssl:/etc/nginx/ssl:ro
       - ./volumes/nginx/waf-guard.conf:/etc/nginx/waf-guard.conf:ro
+      # fail2ban 封禁名单 (f2b_bridge.sh 每分钟同步)，nginx 层按真实 IP 拦截
+      - ./volumes/nginx/f2b-banned.conf:/etc/nginx/f2b-banned.conf:ro
       - ./volumes/php/www:/var/www/html:ro
       # fail2ban 面板静态文件: nginx 的 try_files/index 需在本容器内看到它
       - ./fail2ban-panel:/var/www/html/_f2bapp:ro
@@ -1675,6 +1786,7 @@ EOFNGINXSVC
     ports:
       - "80:80"
       - "443:443"
+      - "443:443/udp"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -1715,6 +1827,7 @@ EOFNGINXSVC
     ports:
       - "80:80"
       - "443:443"
+      - "443:443/udp"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -1722,6 +1835,8 @@ EOFNGINXSVC
       - ./volumes/nginx/conf.d:/etc/nginx/conf.d:ro
       - ./volumes/nginx/ssl:/etc/nginx/ssl:ro
       - ./volumes/nginx/waf-guard.conf:/etc/nginx/waf-guard.conf:ro
+      # fail2ban 封禁名单 (f2b_bridge.sh 每分钟同步)，nginx 层按真实 IP 拦截
+      - ./volumes/nginx/f2b-banned.conf:/etc/nginx/f2b-banned.conf:ro
       - ./volumes/php/www:/var/www/html:ro
       # fail2ban 面板静态文件: nginx 的 try_files/index 需在本容器内看到它
       - ./fail2ban-panel:/var/www/html/_f2bapp:ro
@@ -1992,7 +2107,10 @@ setup_nginx_final() {
     cat > "$nginx_conf_dir/0${config_index}-${DOMAIN}.conf" << EOFMAIN
 server {
     listen 443 ssl;
+    # HTTP/3 (QUIC, UDP 443)。reuseport 全局只能有一处，放在主域名这唯一必然存在的 server 块
+    listen 443 quic reuseport;
     http2 on;
+    http3 on;
     server_name $DOMAIN;
     root /var/www/html/$DOMAIN;
     index index.php index.html index.htm;
@@ -2004,6 +2122,8 @@ server {
     ssl_prefer_server_ciphers off;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 1d;
+    # 告知浏览器可升级到 HTTP/3
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
     add_header Strict-Transport-Security "max-age=63072000" always;
     add_header X-Frame-Options DENY;
     add_header X-Content-Type-Options nosniff;
@@ -2036,7 +2156,9 @@ EOFMAIN
         cat > "$nginx_conf_dir/0${config_index}-${sub}.conf" << EOFSUB
 server {
     listen 443 ssl;
+    listen 443 quic;
     http2 on;
+    http3 on;
     server_name ${sub}.${DOMAIN};
     root /var/www/html/${sub}.${DOMAIN};
     index index.php index.html index.htm;
@@ -2046,6 +2168,7 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
     ssl_prefer_server_ciphers off;
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
 
 ${waf_include}
 
@@ -2067,14 +2190,25 @@ ${waf_include}
 EOFSUB
         config_index=$((config_index + 1))
         
-        # 创建默认欢迎页
+        # 创建默认欢迎页 (仅当站点目录还没有首页时；--cert 重签证书也会走这里，不能覆盖用户网站)
+        if [[ ! -e "$sub_dir/index.html" && ! -e "$sub_dir/index.php" ]]; then
         cat > "$sub_dir/index.html" << EOFHTML
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>${sub}.${DOMAIN}</title>
 <style>body{font-family:system-ui;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;text-align:center}</style>
 </head><body><div><h1>${ICON_ROCKET} ${sub}.${DOMAIN}</h1><p>LNMP Stack Ready!</p></div></body></html>
 EOFHTML
+        fi
     done
+
+    # 站点配置被重写后，重新注入 fail2ban 面板入口 (面板已安装时)
+    local panel_inc_ct panel_inc_host
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        panel_inc_host="$PROJECT_DIR/volumes/nginx/config/nginx/f2b-panel.inc"; panel_inc_ct="/config/nginx/f2b-panel.inc"
+    else
+        panel_inc_host="$PROJECT_DIR/volumes/nginx/ssl/f2b-panel.inc";          panel_inc_ct="/etc/nginx/ssl/f2b-panel.inc"
+    fi
+    [[ -f "$panel_inc_host" ]] && _inject_panel_include "$panel_inc_ct"
     
     log "Nginx HTTPS 配置完成 (共 $config_index 个配置文件)"
 }
@@ -2085,7 +2219,13 @@ setup_index_page() {
     # 确保目录存在
     local web_dir="$PROJECT_DIR/volumes/php/www/$DOMAIN"
     mkdir -p "$web_dir"
-    
+
+    # 已有首页就不覆盖 (重装、续装时用户可能已经上传了网站)
+    if [[ -e "$web_dir/index.php" || -e "$web_dir/index.html" ]]; then
+        log "网站首页已存在，保留不覆盖: $web_dir"
+        return 0
+    fi
+
     cat > "$web_dir/index.php" << 'EOFPHP'
 <?php
 $redis_status = "未连接";
@@ -2263,10 +2403,10 @@ obtain_ssl_certificate() {
         local network_name=""
         # Wait a moment for network to be created
         sleep 2
-        network_name=$(docker network ls --filter "name=${PROJECT_NAME}" --format '{{.Name}}' | grep -E '_default$|_net$' | head -1)
+        network_name=$(docker network ls --filter "name=${PROJECT_NAME}" --format '{{.Name}}' | grep -E '_default$|_net$' | head -1) || true
         if [[ -z "$network_name" ]]; then
             # Fallback: try to get network from running container
-            network_name=$(docker inspect "${PROJECT_NAME}_nginx" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null | head -1)
+            network_name=$(docker inspect "${PROJECT_NAME}_nginx" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null | head -1) || true
         fi
         if [[ -z "$network_name" ]]; then
             network_name="${PROJECT_NAME}_default"
@@ -2300,8 +2440,10 @@ LOG_FILE="./cert-renewal.log"
 echo "[$(date)] 开始检查证书续期..." >> "$LOG_FILE"
 
 # 尝试续期证书
-# 注意: certbot 服务的 entrypoint 被改为常驻睡眠，必须用 --entrypoint 覆盖才能真正执行 renew
-if docker compose run --rm --entrypoint certbot certbot renew --quiet 2>> "$LOG_FILE"; then
+# 用 certbot/dns-cloudflare 镜像: 通配符证书是用 Cloudflare 插件申请的，普通 certbot 镜像没有这个插件，
+# 续期必然失败、90 天后证书过期。该镜像就是 certbot + 插件，单域名 (webroot) 证书同样能续。
+if docker run --rm -v "$PWD/certbot/conf:/etc/letsencrypt" -v "$PWD/certbot/www:/var/www/certbot" \
+        certbot/dns-cloudflare renew --quiet 2>> "$LOG_FILE"; then
     echo "[$(date)] 证书续期检查完成" >> "$LOG_FILE"
     # 只有续期成功才重载 Nginx
     if docker compose exec -T nginx nginx -t 2>> "$LOG_FILE"; then
@@ -2335,7 +2477,52 @@ EOFRENEW
     else
         log "证书续期任务已存在于 crontab 中"
     fi
-    
+
+    rm -f "$temp_cron"
+}
+
+# ======================== 日志大小控制 ========================
+# nginx 日志落在宿主机 bind mount 上，扫描流量大时一天就能涨到上百 MB，
+# 拖慢 fail2ban 扫描并占满磁盘。系统 logrotate 每天才跑一次，压不住这种增速，
+# 所以用每 5 分钟一次的 cron: 单个日志超过上限就原地截断，只留末尾一小段。
+setup_log_rotate() {
+    local script="$PROJECT_DIR/log_rotate.sh"
+    local log_dir; log_dir=$(dirname "$(get_nginx_access_log)")
+
+    cat > "$script" << EOFROTATE
+#!/bin/bash
+# 由 deploy.sh 生成: 日志超过 MAX_BYTES 时轮转 —— 改名为 .1 (覆盖上一份)，再让 nginx 重新打开日志。
+# 不用原地截断: 截断后 fail2ban 会从头重读保留下来的部分，同一批请求被计数两次，封禁阈值被打折。
+# 改名后 fail2ban 发现文件换了 (inode 变化)，会从新的空文件开始读。磁盘上最多约 2 × 10M。
+SCRIPT_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+MAX_BYTES=\$((10 * 1024 * 1024))   # 单个日志上限 10M
+rotated=0
+for f in "${log_dir}"/*.log; do
+    [[ -f "\$f" && ! -L "\$f" ]] || continue
+    size=\$(stat -c%s "\$f" 2>/dev/null || echo 0)
+    if (( size > MAX_BYTES )); then
+        # 改名后立即建一个空文件: 万一 reopen 失败，fail2ban 重启时 logpath 仍存在，不会整体起不来
+        mv -f "\$f" "\$f.1" && : > "\$f" && rotated=1
+    fi
+done
+if [[ \$rotated -eq 1 ]]; then
+    # reopen: nginx 关闭旧文件句柄、按原路径新建日志，不中断请求
+    (cd "\$SCRIPT_DIR" && docker compose exec -T nginx nginx -s reopen) >/dev/null 2>&1 \\
+        || (cd "\$SCRIPT_DIR" && docker compose restart nginx) >/dev/null 2>&1 || true
+fi
+EOFROTATE
+    chmod +x "$script"
+
+    local cron_job="*/5 * * * * $script >/dev/null 2>&1"
+    local temp_cron; temp_cron=$(mktemp)
+    crontab -l > "$temp_cron" 2>/dev/null || true
+    if ! grep -q "$script" "$temp_cron" 2>/dev/null; then
+        echo "$cron_job" >> "$temp_cron"
+        crontab "$temp_cron" 2>/dev/null && log "日志大小控制已配置 (每 5 分钟检查，单个日志上限 10M)" \
+            || warn "无法添加日志控制 crontab，请手动添加: $cron_job"
+    else
+        log "日志大小控制任务已存在于 crontab 中"
+    fi
     rm -f "$temp_cron"
 }
 
@@ -2362,19 +2549,32 @@ if [[ -z "$MYSQL_ROOT_PASS" ]]; then
     exit 1
 fi
 
+# 备份文件含全部数据库内容，只允许 root 读
+umask 077
+MYSQL_CT="${PROJECT_NAME:-lnmp}_mysql"
+
 # 备份数据库 (兼容 MariaDB 和 MySQL)
-# MariaDB 10.5+ 使用 mariadb-dump，旧版本和 MySQL 使用 mysqldump
-DUMP_CMD="mariadb-dump"
-if ! docker exec lnmp_mysql command -v mariadb-dump &>/dev/null; then
-    DUMP_CMD="mysqldump"
+# MariaDB 10.5+ 使用 mariadb-dump (11.x 起已没有 mysqldump)，旧版本和 MySQL 使用 mysqldump。
+# 必须经 sh -c 探测: command 是 shell 内建命令，直接 docker exec command 永远失败
+DUMP_CMD="mysqldump"
+if docker exec "$MYSQL_CT" sh -c 'command -v mariadb-dump' >/dev/null 2>&1; then
+    DUMP_CMD="mariadb-dump"
 fi
 
-# 通过 MYSQL_PWD 环境变量传密码，避免 -p<pass> 暴露在宿主机进程列表 (ps/docker top)
-if docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASS" lnmp_mysql $DUMP_CMD -uroot --all-databases > "$BACKUP_DIR/db_$DATE.sql" 2>/dev/null; then
+# 通过 MYSQL_PWD 环境变量传密码，避免暴露在宿主机进程列表 (ps/docker top)。
+# 「-e MYSQL_PWD」不带值 = 从当前环境继承；写成 -e MYSQL_PWD=xxx 密码会出现在 docker 命令行里
+# 先写 .partial，导出成功且内容完整才改名，避免失败时留下一个看似正常的残缺备份
+DB_OUT="$BACKUP_DIR/db_$DATE.sql"
+if MYSQL_PWD="$MYSQL_ROOT_PASS" docker exec -e MYSQL_PWD "$MYSQL_CT" $DUMP_CMD -uroot --all-databases \
+        --single-transaction --routines --events > "$DB_OUT.partial" 2>"$BACKUP_DIR/.dump_err" \
+   && tail -n 3 "$DB_OUT.partial" | grep -q 'Dump completed'; then
+    mv -f "$DB_OUT.partial" "$DB_OUT"
     echo "[$(date)] 数据库备份成功: db_$DATE.sql (使用 $DUMP_CMD)"
 else
-    echo "[$(date)] 数据库备份失败"
+    rm -f "$DB_OUT.partial"
+    echo "[$(date)] 数据库备份失败: $(tail -n 2 "$BACKUP_DIR/.dump_err" 2>/dev/null | tr '\n' ' ')"
 fi
+rm -f "$BACKUP_DIR/.dump_err"
 
 # 备份网站文件
 if tar -czf "$BACKUP_DIR/www_$DATE.tar.gz" -C "$SCRIPT_DIR/volumes/php" www 2>/dev/null; then
@@ -2468,12 +2668,19 @@ install_fail2ban() {
         fi
         log "fail2ban 安装完成"
     fi
-    # iptables 是封禁动作的前提
-    if ! command -v iptables &>/dev/null; then
+    # iptables + ipset 是封禁动作的前提 (ipset 让几千个封禁 IP 只占一条规则)
+    local pkg missing=()
+    for pkg in iptables ipset; do command -v "$pkg" &>/dev/null || missing+=("$pkg"); done
+    if [[ ${#missing[@]} -gt 0 ]]; then
         if command -v apt-get &>/dev/null; then
-            apt-get install -y -qq iptables < /dev/null 2>/dev/null || true
+            apt-get install -y -qq "${missing[@]}" < /dev/null 2>/dev/null || true
+        elif command -v dnf &>/dev/null; then
+            dnf install -y -q "${missing[@]}" < /dev/null 2>/dev/null || true
+        elif command -v yum &>/dev/null; then
+            yum install -y -q "${missing[@]}" < /dev/null 2>/dev/null || true
         fi
     fi
+    command -v ipset &>/dev/null || warn "未能安装 ipset，网站封禁动作将无法执行，请手动安装: apt-get install ipset"
     systemctl enable --now fail2ban 2>/dev/null || true
     return 0
 }
@@ -2495,44 +2702,124 @@ setup_fail2ban_config() {
     cat > /etc/fail2ban/filter.d/lnmp-nginx.conf << 'EOFF2BFILTER'
 [Definition]
 # 匹配被 WAF 拦截(444)、限流(429)或拒绝(403)的请求行，源 IP = <HOST>
-failregex = ^<HOST> - \S+ \[[^\]]+\] "(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH|CONNECT)[^"]*" (444|429|403)
-            ^<HOST> - \S+ \[[^\]]+\] "[^"]*(\.env|\.git|wp-login\.php|xmlrpc\.php|/vendor/)[^"]*" \d+
+# 注意: fail2ban 匹配前会把时间戳从行里删掉 (剩 "[]")，故用 \[[^\]]*\] 而非 \[[^\]]+\]，
+# 否则任何行都匹配不上 (表现为有拦截统计但 Total failed 始终为 0)。
+# 第二条只看请求路径 (不含 ? 后的参数)，避免 "?q=.env" 这类正常搜索被误计；
+# \.git 后要求 / 或结尾，避免误中 /.github/ 之类的正常路径
+failregex = ^<HOST> - \S+ \[[^\]]*\] "(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH|CONNECT)[^"]*" (444|429|403)
+            ^<HOST> - \S+ \[[^\]]*\] "[A-Z]+ [^ ?"]*(/\.env|/\.git(/|[ ?])|/wp-login\.php|/xmlrpc\.php|/vendor/)
 ignoreregex =
+# 显式指定 nginx $time_local 的时间格式 (如 29/Oct/2026:10:00:00 +0800)。
+# 不指定时 fail2ban 要对每一行逐个尝试几十种时间模板，日志量大时 CPU 占用很高。
+datepattern = %%d/%%b/%%Y:%%H:%%M:%%S %%z
 EOFF2BFILTER
 
     # --- 封禁动作: 把 IP DROP 进 DOCKER-USER 链 (Docker 发布端口绕过 INPUT) ---
     # Docker 发布的 80/443 流量走 nat/PREROUTING -> DOCKER 链，不经 INPUT；
     # DOCKER-USER 是 Docker 官方保证在 DOCKER 之前处理、且用户可控的链。
+    # 用 ipset 保存封禁 IP: 不管封多少个，DOCKER-USER 里都只有一条匹配规则 (哈希查找)，
+    # 每 IP 一条 iptables 规则时，几千条规则会让每个进入容器的包逐条比对，CPU 开销很大。
+    # 只封 IPv4；timeout 0 = 永不过期，由 fail2ban 自己按 bantime 解封。
     cat > /etc/fail2ban/action.d/docker-user.conf << 'EOFF2BACTION'
 [Definition]
-# 启动时确保 DOCKER-USER 链存在并有兜底 RETURN (Docker 未运行时忽略错误)
-actionstart = iptables -N DOCKER-USER 2>/dev/null || true
-actionstop  =
-actioncheck =
-# -I 插到链首，确保在 Docker 自己的放行规则之前生效
-actionban   = iptables -I DOCKER-USER -s <ip> -j DROP
-actionunban = iptables -D DOCKER-USER -s <ip> -j DROP
+actionstart = ipset -exist create f2b-lnmp hash:ip timeout 0 maxelem 262144
+              iptables -N DOCKER-USER 2>/dev/null || true
+              iptables -C DOCKER-USER -m set --match-set f2b-lnmp src -j DROP 2>/dev/null || iptables -I DOCKER-USER -m set --match-set f2b-lnmp src -j DROP
+# 停止时只清空集合，不删规则和集合: Docker 可能正在引用，删除会报错
+actionstop  = ipset flush f2b-lnmp 2>/dev/null || true
+# 每次封禁前检查规则还在；被 firewalld reload / iptables-restore 等清掉时，fail2ban 会自动重跑 actionstart
+actioncheck = iptables -C DOCKER-USER -m set --match-set f2b-lnmp src -j DROP
+# IPv6 地址不封 (不加入集合，也不会报错)。
+# 注意: 值里不能出现「空格+分号」，fail2ban 解析配置时会把 " ;" 后面当注释截掉 (所以不用 case ... ;;)
+actionban   = echo "<ip>" | grep -q : || ipset -exist add f2b-lnmp <ip>
+actionunban = echo "<ip>" | grep -q : || ipset -exist del f2b-lnmp <ip>
 
 [Init]
 EOFF2BACTION
 
-    # --- jail: 宽松档 (60s 内 10 次异常封 1 小时) ---
+    # --- 白名单: 放在 [DEFAULT]，对 lnmp-nginx 与 sshd 都生效 ---
+    # 默认白名单: 本机 + 局域网/内网网段，始终保证在列，不被误封。
+    #   10/8 172.16/12 192.168/16  RFC1918 局域网 (含 Docker 网桥 172.17-31.x)
+    #   100.64/10                  运营商 CGNAT / Tailscale 等组网
+    #   fc00::/7 fe80::/10         IPv6 内网 / 链路本地
+    # 再合并已有 ignoreip (用户手动加的 IP、面板加白的 IP)，--reconfig 不会冲掉它们。
+    local jail_file="/etc/fail2ban/jail.d/lnmp.local"
+    local lan_ignore="127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10"
+    local old_ignore ignoreip
+    old_ignore=$(grep -m1 -E '^ignoreip[[:space:]]*=' "$jail_file" 2>/dev/null \
+        | sed -E 's/^ignoreip[[:space:]]*=[[:space:]]*//') || true
+    # Cloudflare 节点也加入白名单: 万一真实 IP 还原没生效 (日志里记的是 CF 节点)，
+    # fail2ban 也不会把 CF 节点封掉，避免大批正常访客被误封
+    # ::/0 = 全部 IPv6 地址: 只封 IPv4，IPv6 一律不封 (网站与 SSH 都适用)
+    ignoreip=$(printf '%s\n' $lan_ignore $CF_IP_RANGES ::/0 $old_ignore | awk 'NF && !seen[$0]++' | paste -sd' ' -)
+
+    # --- SSH 爆破封禁: 探测 sshd 日志来源与端口 ---
+    # sshd 是宿主机服务，封在 INPUT 链 (iptables-multiport)，与网站的 DOCKER-USER 链分开。
+    # 日志来源必须可用，否则 jail 加载失败会拖垮整个 fail2ban，探测不到就跳过。
+    local sshd_section="" ssh_desc=""
+    if command -v sshd &>/dev/null || [[ -f /etc/ssh/sshd_config ]]; then
+        local ssh_port
+        ssh_port=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | paste -sd, -) || true
+        [[ -z "$ssh_port" ]] && { ssh_port=$(awk 'tolower($1)=="port"{print $2}' /etc/ssh/sshd_config 2>/dev/null | paste -sd, -) || true; }
+        [[ -z "$ssh_port" ]] && ssh_port="22"
+
+        local ssh_src=""
+        if [[ -f /var/log/auth.log ]]; then
+            ssh_src="logpath   = /var/log/auth.log"          # Debian 11 / Ubuntu
+        elif [[ -f /var/log/secure ]]; then
+            ssh_src="logpath   = /var/log/secure"            # CentOS / RHEL
+        else
+            # Debian 12 默认无 rsyslog，日志只在 journald；systemd 后端需要 python3-systemd
+            if ! python3 -c 'import systemd.journal' &>/dev/null && command -v apt-get &>/dev/null; then
+                apt-get install -y -qq python3-systemd < /dev/null &>/dev/null || true
+            fi
+            if python3 -c 'import systemd.journal' &>/dev/null; then
+                ssh_src="backend   = systemd"
+            fi
+        fi
+
+        if [[ -n "$ssh_src" ]]; then
+            sshd_section="[sshd]
+enabled   = true
+port      = ${ssh_port}
+${ssh_src}
+banaction = iptables-multiport
+# 10 分钟内认证失败 5 次 -> 封禁 24 小时
+maxretry  = 5
+findtime  = 600
+bantime   = 86400"
+            ssh_desc="SSH 端口 ${ssh_port}"
+        else
+            warn "未找到可用的 SSH 日志来源 (auth.log / secure / journald)，跳过 SSH 爆破封禁"
+            # 显式关闭: Debian 自带配置默认启用 sshd jail，找不到日志会让整个 fail2ban 起不来
+            sshd_section="[sshd]
+enabled   = false"
+        fi
+    fi
+
     mkdir -p /etc/fail2ban/jail.d
-    cat > /etc/fail2ban/jail.d/lnmp.local << EOFF2BJAIL
+    cat > "$jail_file" << EOFF2BJAIL
+[DEFAULT]
+# 全局白名单: 本机/内网 + 你的固定出口 IP (空格分隔追加)，对网站和 SSH 都生效。
+# 网页面板的「加白名单」也写到这一行。
+ignoreip  = ${ignoreip}
+
 [lnmp-nginx]
 enabled   = true
 filter    = lnmp-nginx
 logpath   = ${access_log}
 banaction = docker-user
-# 封禁强度 (宽松档): 60 秒内命中 10 次 -> 封禁 1 小时
-maxretry  = 10
-findtime  = 60
-bantime   = 3600
-# 不封禁本机/内网 (按需把你的固定出口 IP 加到这里避免误封)
-ignoreip  = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+# 封禁强度: 1 小时内命中 5 次 -> 封禁 24 小时。
+# 分布式扫描会把请求分散到大量 IP，单 IP 每分钟只有一两次，
+# 用 "60 秒 10 次" 永远凑不满；只统计 444/429/403 与敏感路径，正常访客几乎不会触发。
+maxretry  = 5
+findtime  = 3600
+bantime   = 86400
+
+${sshd_section}
 EOFF2BJAIL
 
-    log "fail2ban 配置完成 (日志: ${access_log})"
+    log "fail2ban 配置完成 (网站日志: ${access_log}${ssh_desc:+；已启用 ${ssh_desc} 爆破封禁})"
 
     # 重载 fail2ban 使配置生效
     if systemctl is-active --quiet fail2ban 2>/dev/null; then
@@ -2542,6 +2829,75 @@ EOFF2BJAIL
     fi
 }
 
+# 本地 GeoIP 国家库: DB-IP "IP to Country Lite" (免费、无需注册，CC BY 4.0，按月更新)。
+# 面板的国家/地区列由桥接脚本用 mmdblookup 离线查这个库，不调用任何在线 IP 查询接口。
+setup_geoip_db() {
+    local geo_dir="$PROJECT_DIR/volumes/geoip"
+    local updater="$PROJECT_DIR/geoip_update.sh"
+    mkdir -p "$geo_dir"
+
+    # mmdblookup 在 Debian/Ubuntu 的 mmdb-bin 包、RHEL 系的 libmaxminddb 包里
+    if ! command -v mmdblookup &>/dev/null; then
+        info "安装 mmdblookup (本地 GeoIP 查询工具)..."
+        if command -v apt-get &>/dev/null; then
+            apt-get install -y -qq mmdb-bin < /dev/null &>/dev/null || true
+        elif command -v dnf &>/dev/null; then
+            dnf install -y -q libmaxminddb < /dev/null &>/dev/null || true
+        elif command -v yum &>/dev/null; then
+            yum install -y -q libmaxminddb < /dev/null &>/dev/null || true
+        fi
+    fi
+
+    cat > "$updater" << 'EOFGEOUPD'
+#!/bin/bash
+# 由 deploy.sh 生成: 下载/更新 DB-IP 国家库 (每月 1 日前后发布新版)。
+# 下载失败时保留旧库，不影响面板。
+GEO_DIR="$(cd "$(dirname "$0")" && pwd)/volumes/geoip"
+DB="$GEO_DIR/dbip-country-lite.mmdb"
+mkdir -p "$GEO_DIR"
+tmp=$(mktemp "$GEO_DIR/.dl.XXXXXX")
+ok=0
+# 当月文件有时月初还没发布，失败则回退上月
+for ym in "$(date +%Y-%m)" "$(date -d "$(date +%Y-%m-01) -1 month" +%Y-%m 2>/dev/null)"; do
+    [[ -n "$ym" ]] || continue
+    if curl -fsSL -m 120 "https://download.db-ip.com/free/dbip-country-lite-${ym}.mmdb.gz" -o "$tmp.gz" \
+        && gunzip -c "$tmp.gz" > "$tmp" && [[ -s "$tmp" ]]; then
+        ok=1; break
+    fi
+done
+if [[ $ok -eq 1 ]] && { ! command -v mmdblookup &>/dev/null || mmdblookup --file "$tmp" --ip 8.8.8.8 country iso_code &>/dev/null; }; then
+    mv -f "$tmp" "$DB"; chmod 644 "$DB"
+    echo "[$(date '+%F %T')] GeoIP 库已更新"
+else
+    rm -f "$tmp"
+    echo "[$(date '+%F %T')] GeoIP 库下载失败，保留旧库"
+fi
+rm -f "$tmp.gz"
+EOFGEOUPD
+    chmod +x "$updater"
+
+    if [[ ! -s "$geo_dir/dbip-country-lite.mmdb" ]]; then
+        info "下载 GeoIP 国家库 (DB-IP Lite, 约 7MB)..."
+        bash "$updater" || true
+    fi
+    if [[ -s "$geo_dir/dbip-country-lite.mmdb" ]]; then
+        log "GeoIP 国家库就绪: $geo_dir/dbip-country-lite.mmdb"
+    else
+        warn "GeoIP 库下载失败，面板国家列将显示「未知」；稍后可手动运行: $updater"
+    fi
+    command -v mmdblookup &>/dev/null || warn "未能安装 mmdblookup，面板国家列将显示「未知」"
+
+    # 每月 3 日凌晨 4 点更新一次，幂等
+    local cron_job="0 4 3 * * $updater >/dev/null 2>&1"
+    local temp_cron; temp_cron=$(mktemp)
+    crontab -l > "$temp_cron" 2>/dev/null || true
+    if ! grep -q "$updater" "$temp_cron" 2>/dev/null; then
+        echo "$cron_job" >> "$temp_cron"
+        crontab "$temp_cron" 2>/dev/null || warn "无法添加 GeoIP 更新 crontab，请手动添加: $cron_job"
+    fi
+    rm -f "$temp_cron"
+}
+
 # 生成宿主机 cron 桥接脚本 (队列隔离的核心)
 # PHP 面板永远不直接调用 fail2ban-client，只与 /var/f2b 下的文件交互；
 # 本脚本以 root 每分钟运行，负责导出封禁列表 + 校验消费解封队列。
@@ -2549,6 +2905,7 @@ setup_f2b_bridge() {
     local bridge="$PROJECT_DIR/f2b_bridge.sh"
     local f2b_dir="$PROJECT_DIR/volumes/fail2ban"
     mkdir -p "$f2b_dir"
+    setup_geoip_db
     # 目录需让 PHP 容器内 www-data 写 unban-queue (bind mount 按 UID 映射)。
     # php:*-fpm-alpine 的 www-data 为 UID/GID 82 —— 把目录归属给它并用 0770，
     # 既满足面板写入，又避免 0777 让宿主机上任意本地用户都能投递队列、
@@ -2558,6 +2915,12 @@ setup_f2b_bridge() {
 
     # 桥接脚本需要知道 nginx access.log 的宿主机路径 (随 NGINX_TYPE)，安装时实填
     local access_log; access_log=$(get_nginx_access_log)
+    local nginx_banlist
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        nginx_banlist="$PROJECT_DIR/volumes/nginx/config/nginx/f2b-banned.conf"
+    else
+        nginx_banlist="$PROJECT_DIR/volumes/nginx/f2b-banned.conf"
+    fi
 
     cat > "$bridge" << EOFBRIDGE
 #!/bin/bash
@@ -2570,21 +2933,41 @@ F2B_DIR="\$SCRIPT_DIR/volumes/fail2ban"
 JAIL="lnmp-nginx"
 JAIL_LOCAL="/etc/fail2ban/jail.d/lnmp.local"
 ACCESS_LOG="${access_log}"
+NGINX_BANLIST="${nginx_banlist}"
 BANNED_FILE="\$F2B_DIR/banned.txt"
 UNBAN_QUEUE="\$F2B_DIR/unban-queue"
 BAN_QUEUE="\$F2B_DIR/ban-queue"
 WL_QUEUE="\$F2B_DIR/whitelist-queue"
 META_FILE="\$F2B_DIR/meta.json"
 STATS_FILE="\$F2B_DIR/stats.json"
-LOG_FILE="\$F2B_DIR/bridge.log"
+# 锁、日志、临时文件都放在 root 专属目录。F2B_DIR 对 PHP 容器 (www-data) 可写，
+# root 若在里面创建/截断文件，可被预先放置的符号链接引向 /etc/shadow 等系统文件
+PRIV_DIR="/var/lib/lnmp-f2b"
+LOG_FILE="\$PRIV_DIR/bridge.log"
 
 mkdir -p "\$F2B_DIR"
+mkdir -p "\$PRIV_DIR" && chmod 700 "\$PRIV_DIR"
 EOFBRIDGE
 
     # 其余脚本主体不含需要插值的变量，用 quoted heredoc 追加 (避免 $ 转义地狱)
     cat >> "$bridge" << 'EOFBRIDGE2'
 
-log_line() { echo "[$(date '+%F %T')] $*" >> "$LOG_FILE"; }
+log_line() { echo "[$(date '+%F %T')] $*" >> "$LOG_FILE" 2>/dev/null || true; }
+
+# 防重入: 上一轮还没跑完 (日志大、封禁多时) 就跳过本轮，避免每分钟叠加多个进程抢 CPU
+exec 9>"$PRIV_DIR/bridge.lock"
+if command -v flock &>/dev/null && ! flock -n 9; then exit 0; fi
+# 桥接只是后台统计，让出 CPU 给网站
+renice -n 10 $$ >/dev/null 2>&1 || true
+
+# 往共享目录 (PHP 可写) 安全地写一个文件: 先在 root 专属目录写好，再 mv -T 原子替换。
+# mv 替换的是目录项本身，目标就算被换成指向系统文件的符号链接，也只是替换掉这个链接，不会写穿
+publish() {  # publish <目标路径> <内容来源文件> [权限]
+    local dst="$1" src="$2" mode="${3:-644}"
+    chmod "$mode" "$src" 2>/dev/null || true
+    mv -fT "$src" "$dst" 2>/dev/null || { rm -f "$src"; log_line "publish failed: $dst"; }
+}
+ptmp() { mktemp "$PRIV_DIR/tmp.XXXXXX"; }
 
 # 合法 IP 校验 (IPv4 或含冒号的 IPv6)，拒绝一切其它字符
 is_valid_ip() {
@@ -2593,33 +2976,45 @@ is_valid_ip() {
     return 1
 }
 
-# 原子取走队列内容到 stdout，并清空原队列 (避免与面板并发写冲突)
-drain_queue() {
-    local q="$1"
-    [[ -s "$q" ]] || return 0
-    local tmp="$q.processing.$$"
-    mv "$q" "$tmp" 2>/dev/null || { cp "$q" "$tmp"; : > "$q"; }
-    # 重建空队列后归属给 www-data(82) 并用 660，仅面板可写，不对全机开放
-    : > "$q"; chown 82:82 "$q" 2>/dev/null || true; chmod 660 "$q" 2>/dev/null || true
-    cat "$tmp"; rm -f "$tmp"
+# IPv4 是否落在 jail.local 的 ignoreip (含 CIDR) 内。
+# fail2ban 的 banip 不检查 ignoreip，面板手动封禁时要自己拦住，
+# 否则误封 Cloudflare 节点 / Docker 网桥 / 局域网会让大量正常访问被丢包
+# 10# 强制十进制: 「010」「08」这类前导零写法否则会被当八进制甚至报错
+ip2int() { local IFS=.; set -- $1; echo $(( (10#$1<<24) + (10#$2<<16) + (10#$3<<8) + 10#$4 )); }
+is_ignored_ip() {
+    local ip="$1" n net bits mask
+    n=$(ip2int "$ip")
+    for net in $(grep -m1 -E "^ignoreip\b" "$JAIL_LOCAL" 2>/dev/null | sed -E 's/^ignoreip[[:space:]]*=?//'); do
+        [[ "$net" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] || continue
+        bits=32; [[ "$net" == */* ]] && bits="${net#*/}"
+        (( bits <= 32 )) || continue
+        mask=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+        (( (n & mask) == ($(ip2int "${net%/*}") & mask) )) && return 0
+    done
+    return 1
 }
 
-# ---- 1) 导出当前封禁 IP 列表 ----
-if command -v fail2ban-client &>/dev/null; then
-    fail2ban-client status "$JAIL" 2>/dev/null \
-        | grep -oE 'Banned IP list:.*' \
-        | sed 's/Banned IP list:[[:space:]]*//' \
-        | tr ' ' '\n' | grep -v '^$' > "$BANNED_FILE.tmp" 2>/dev/null || true
-    mv "$BANNED_FILE.tmp" "$BANNED_FILE" 2>/dev/null || true
-    chmod 644 "$BANNED_FILE" 2>/dev/null || true
-fi
+# 原子取走队列内容到 stdout。只 mv 走，不由 root 重建队列文件 —— 面板下次写入时
+# 会以 www-data 身份自己创建 (FILE_APPEND)；mv 之后到达的写入落在新文件里，下一轮处理，不会丢。
+# 队列是符号链接时直接删掉不读，防止 root 被骗去读写别处的文件。
+drain_queue() {
+    local q="$1"
+    if [[ -L "$q" ]]; then rm -f "$q"; log_line "REJECTED symlink queue: $q"; return 0; fi
+    [[ -f "$q" && -s "$q" ]] || return 0
+    local tmp; tmp=$(ptmp)
+    mv -fT "$q" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    # 只取前 2000 行，防止队列被灌入超大文件拖住 root 进程
+    head -n 2000 "$tmp"; rm -f "$tmp"
+}
 
-# ---- 2) 消费解封队列 ----
+# ---- 2) 消费解封队列 ---- (先处理面板提交的操作，再导出封禁列表，操作当轮就能生效)
 while IFS= read -r ip; do
     ip="$(echo "$ip" | tr -d '[:space:]')"; [[ -z "$ip" ]] && continue
     if is_valid_ip "$ip"; then
         fail2ban-client set "$JAIL" unbanip "$ip" >/dev/null 2>&1 \
             && log_line "unbanned $ip" || log_line "unban noop $ip"
+        # SSH jail 若存在也一并解封 (误封自己 SSH 时可从面板自救)
+        fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1 && log_line "unbanned $ip (sshd)" || true
     else
         log_line "REJECTED invalid unban ip: $ip"
     fi
@@ -2628,7 +3023,11 @@ done < <(drain_queue "$UNBAN_QUEUE")
 # ---- 3) 消费手动封禁队列 ----
 while IFS= read -r ip; do
     ip="$(echo "$ip" | tr -d '[:space:]')"; [[ -z "$ip" ]] && continue
-    if is_valid_ip "$ip"; then
+    if [[ "$ip" == *:* ]]; then
+        log_line "SKIP ipv6 ban (IPv6 不封): $ip"
+    elif is_valid_ip "$ip" && is_ignored_ip "$ip"; then
+        log_line "REJECTED ban of whitelisted ip: $ip"
+    elif is_valid_ip "$ip"; then
         fail2ban-client set "$JAIL" banip "$ip" >/dev/null 2>&1 \
             && log_line "banned $ip" || log_line "ban failed $ip"
     else
@@ -2649,14 +3048,67 @@ while IFS= read -r ip; do
             WL_CHANGED=1; log_line "whitelisted $ip"
         fi
     elif [[ -f "$JAIL_LOCAL" ]]; then
-        echo "ignoreip = 127.0.0.1/8 ::1 $ip" >> "$JAIL_LOCAL"
+        echo "ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10 $ip" >> "$JAIL_LOCAL"
         WL_CHANGED=1; log_line "whitelisted $ip (new line)"
     fi
-    fail2ban-client set "$JAIL" unbanip "$ip" >/dev/null 2>&1 || true
+    # 写进配置文件是为了重启后保留；addignoreip 让网站与 SSH 两个 jail 立即生效，不必重载
+    for j in "$JAIL" sshd; do
+        fail2ban-client set "$j" addignoreip "$ip" >/dev/null 2>&1 || true
+        fail2ban-client set "$j" unbanip "$ip" >/dev/null 2>&1 || true
+    done
 done < <(drain_queue "$WL_QUEUE")
-[[ "$WL_CHANGED" == "1" ]] && { fail2ban-client reload "$JAIL" >/dev/null 2>&1 || systemctl reload fail2ban 2>/dev/null || true; }
+
+# ---- 1) 导出当前封禁 IP 列表 (网站 jail -> banned.txt，SSH jail -> banned-sshd.txt) ----
+# fail2ban 暂时不可用 (重启/重载中) 时保留上一轮的文件，不能写成空列表 ——
+# 否则面板显示 0 个封禁，nginx 层封禁名单也会被清空、整批放行
+F2B_OK=0
+if command -v fail2ban-client &>/dev/null; then
+    for j in "$JAIL" sshd; do
+        out="$BANNED_FILE"; [[ "$j" == "sshd" ]] && out="$F2B_DIR/banned-sshd.txt"
+        st=$(fail2ban-client status "$j" 2>/dev/null) || continue
+        [[ "$j" == "$JAIL" ]] && F2B_OK=1
+        t=$(ptmp)
+        printf '%s\n' "$st" | grep -oE 'Banned IP list:.*' | sed 's/Banned IP list:[[:space:]]*//' \
+            | tr ' ' '\n' | grep -v '^$' > "$t" || true
+        # root 自己保留一份 (下面生成 nginx 名单、统计命中都读这份)；共享目录里那份 PHP 可改，不可信
+        [[ "$j" == "$JAIL" ]] && cp -f "$t" "$PRIV_DIR/banned.txt"
+        publish "$out" "$t" 644
+    done
+fi
+
+# ---- 1b) 同步 nginx 封禁名单 (geo 格式: 一行一个 "IP 1;")，有变化才重载 nginx ----
+# 站点走 Cloudflare 时，连到服务器的是 CF 节点，iptables 按访客 IP 封不住；
+# nginx 在真实 IP 还原之后按访客 IP 返回 444，这一层才真正生效。
+# 重载最多 5 分钟一次: 扫描高峰名单每分钟都在变，频繁重载会堆积旧 worker
+if [[ "$F2B_OK" == "1" && -n "${NGINX_BANLIST:-}" && ! -L "$NGINX_BANLIST" ]]; then
+    tmp_bl=$(ptmp)
+    { while IFS= read -r bip; do
+          # 只写 IPv4，IPv6 不封
+          if [[ "$bip" != *:* ]] && is_valid_ip "$bip"; then printf '%s 1;\n' "$bip"; fi
+      done < "$PRIV_DIR/banned.txt"; } 2>/dev/null | sort -u > "$tmp_bl" || true
+    stamp="$PRIV_DIR/banlist.reloaded"
+    if ! cmp -s "$tmp_bl" "$NGINX_BANLIST" 2>/dev/null \
+       && [[ ! -f "$stamp" || -n "$(find "$stamp" -mmin +4 2>/dev/null)" ]]; then
+        bak=$(ptmp); cp -f "$NGINX_BANLIST" "$bak" 2>/dev/null || : > "$bak"
+        # 原地覆盖 (保持 inode)，bind mount 进容器的单文件才能看到新内容
+        if cat "$tmp_bl" > "$NGINX_BANLIST" 2>/dev/null; then
+            if (cd "$SCRIPT_DIR" && docker compose exec -T nginx nginx -t) >/dev/null 2>&1; then
+                (cd "$SCRIPT_DIR" && docker compose exec -T nginx nginx -s reload) >/dev/null 2>&1 \
+                    && log_line "nginx banlist reloaded ($(wc -l < "$NGINX_BANLIST") IPs)" || true
+                touch "$stamp"
+            else
+                # 校验失败就还原，避免下次 nginx 重启时因坏名单起不来
+                cat "$bak" > "$NGINX_BANLIST" 2>/dev/null || true
+                log_line "nginx -t failed with new banlist, reverted"
+            fi
+        fi
+        rm -f "$bak"
+    fi
+    rm -f "$tmp_bl"
+fi
 
 # ---- 5) 导出 meta.json: 每个被封 IP 的命中次数 + 当前白名单 ----
+meta_t=$(ptmp)
 {
     echo "{"
     echo "  \"updated\": \"$(date '+%F %T')\","
@@ -2670,28 +3122,26 @@ done < <(drain_queue "$WL_QUEUE")
         [[ -z "$wl" ]] && wl="[]"
     fi
     echo "  \"whitelist\": $wl,"
-    # 每个被封 IP 在 access.log 中的命中次数 (近似: grep 计数)
+    # 每个被封 IP 在 access.log 中的命中次数。只扫一遍日志统计全部 IP，
+    # 不能每个 IP 各 grep 一次 —— 封禁数上百时就是每分钟上百次全文件扫描，CPU 吃满
     echo "  \"hits\": {"
-    first=1
-    if [[ -f "$BANNED_FILE" ]]; then
-        while IFS= read -r bip; do
-            [[ -z "$bip" ]] && continue
-            cnt=0
-            [[ -f "$ACCESS_LOG" ]] && cnt=$(grep -c "^$bip " "$ACCESS_LOG" 2>/dev/null || echo 0)
-            [[ $first -eq 0 ]] && echo ","
-            printf '    "%s": %s' "$bip" "$cnt"
-            first=0
-        done < "$BANNED_FILE"
+    if [[ -s "$PRIV_DIR/banned.txt" ]]; then
+        awk -v bf="$PRIV_DIR/banned.txt" '
+            BEGIN { while ((getline ip < bf) > 0) if (ip ~ /^[0-9a-fA-F.:]+$/) { want[ip]=1; order[++n]=ip } }
+            ($1 in want) { cnt[$1]++ }
+            END { for (i=1; i<=n; i++) printf "%s    \"%s\": %d", (i>1 ? ",\n" : ""), order[i], cnt[order[i]]+0 }
+        ' "$ACCESS_LOG" 2>/dev/null || true
     fi
     echo ""
     echo "  }"
     echo "}"
-} > "$META_FILE.tmp" 2>/dev/null && mv "$META_FILE.tmp" "$META_FILE" 2>/dev/null || true
-chmod 644 "$META_FILE" 2>/dev/null || true
+} > "$meta_t" 2>/dev/null || true
+publish "$META_FILE" "$meta_t" 644
 
 # ---- 6) 导出 stats.json: 近 24h 按小时的 444/429/403 计数 + 状态码分布 + Top IP ----
 # 从 access.log 解析 (log_format main: ip - user [time] "req" status ...)
 if [[ -f "$ACCESS_LOG" ]]; then
+    stats_t=$(ptmp)
     # 用 2-arg match + substr 抓状态码 (POSIX，兼容 mawk/gawk/busybox)；
     # 匹配 "...request..." 后紧跟的空格+三位状态码。$1 恒为源 IP。
     awk '
@@ -2723,14 +3173,53 @@ if [[ -f "$ACCESS_LOG" ]]; then
         }
         printf "]\n"
         printf "}\n"
-    }' "$ACCESS_LOG" > "$STATS_FILE.tmp" 2>/dev/null && mv "$STATS_FILE.tmp" "$STATS_FILE" 2>/dev/null || true
-    chmod 644 "$STATS_FILE" 2>/dev/null || true
+    }' "$ACCESS_LOG" > "$stats_t" 2>/dev/null || true
+    publish "$STATS_FILE" "$stats_t" 644
+fi
+
+# ---- 7) IP 归属国家: 用本地 GeoIP 库 (DB-IP Country Lite) 离线查询，结果缓存到 geo-cache.tsv ----
+# 全程本地查询，不把 IP 发给任何外部服务。库文件由 geoip_update.sh 每月更新。
+GEO_DB="$SCRIPT_DIR/volumes/geoip/dbip-country-lite.mmdb"
+# 主缓存放在 root 专属目录里维护，每轮结束后发布一份副本到共享目录给面板读
+GEO_CACHE="$PRIV_DIR/geo-cache.tsv"
+if [[ -s "$GEO_DB" ]] && command -v mmdblookup &>/dev/null; then
+    touch "$GEO_CACHE"
+    # 库文件比上次清缓存的时间新 (刚更新过) 就清空缓存，避免沿用旧结果
+    if [[ "$GEO_DB" -nt "$PRIV_DIR/geo-cache.stamp" ]]; then : > "$GEO_CACHE"; touch "$PRIV_DIR/geo-cache.stamp"; fi
+    want=$( { cat "$F2B_DIR"/banned*.txt 2>/dev/null; grep -oE '"ip":"[^"]+"' "$STATS_FILE" 2>/dev/null | cut -d'"' -f4; } | sort -u ) || true
+    # 先在 BEGIN 里读缓存再过滤 stdin。不能用 NR==FNR 双文件写法:
+    # 缓存为空时 NR==FNR 会落到 stdin 上，把所有 IP 当缓存吞掉，导致永远不查询
+    new_list=$(printf '%s\n' "$want" | awk -F'\t' -v cf="$GEO_CACHE" \
+        'BEGIN{while((getline l < cf)>0){split(l,a,"\t");c[a[1]]=1}} NF && !($1 in c)' | head -100)
+    # 每个 IP 只调一次 mmdblookup 取整个 country 节点，再从输出里解析 iso_code 与中/英文名。
+    # 输出形如:  "iso_code":  换行  "CN" <utf8_string>，值在键的下一行
+    printf '%s\n' "$new_list" | while IFS= read -r ip; do
+        [[ -n "$ip" ]] && is_valid_ip "$ip" || continue
+        geo=$(mmdblookup --file "$GEO_DB" --ip "$ip" country 2>/dev/null | awk '
+            /"[^"]+":[[:space:]]*$/ { match($0, /"[^"]+"/); key = substr($0, RSTART+1, RLENGTH-2); next }
+            /<utf8_string>/ {
+                match($0, /"[^"]*"/); v = substr($0, RSTART+1, RLENGTH-2)
+                if (key == "iso_code") cc = v; else if (key == "zh-CN") zh = v; else if (key == "en") en = v
+            }
+            END { printf "%s\t%s", cc, (zh != "" ? zh : en) }')
+        cc=${geo%%$'\t'*}
+        cn=$(printf '%s' "${geo#*$'\t'}" | tr -d '\t\r\n<>&' | cut -c1-60)
+        if [[ -z "$cc" ]]; then cc="--"; cn="内网/未收录"; fi
+        printf '%s\t%s\t%s\n' "$ip" "$cc" "${cn:-未知}" >> "$GEO_CACHE"
+    done
+    # 缓存最多保留 5000 条
+    if (( $(wc -l < "$GEO_CACHE") > 5000 )); then
+        t=$(ptmp); tail -n 5000 "$GEO_CACHE" > "$t" && mv -fT "$t" "$GEO_CACHE"
+    fi
+    t=$(ptmp); cp -f "$GEO_CACHE" "$t" && publish "$F2B_DIR/geo-cache.tsv" "$t" 644
 fi
 
 # 日志超过 2MB 截断
 if [[ -f "$LOG_FILE" ]] && [[ $(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) -gt 2097152 ]]; then
-    tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+    t=$(ptmp); tail -n 500 "$LOG_FILE" > "$t" && mv -fT "$t" "$LOG_FILE"
 fi
+# 清理旧版本留在共享目录里的锁/日志/临时文件 (现已改放 root 专属目录)
+rm -f "$F2B_DIR/.bridge.lock" "$F2B_DIR/bridge.log" "$F2B_DIR"/*.tmp "$F2B_DIR"/geo-cache.tsv.stamp 2>/dev/null || true
 EOFBRIDGE2
     chmod +x "$bridge"
 
@@ -2763,7 +3252,8 @@ setup_f2b_panel() {
     F2B_PANEL_PASS=$(generate_strong_password 20)
     local panel_hash session_secret csrf_secret
     # 用 PHP 生成 bcrypt (面板跑在 PHP 容器里，宿主机不一定有 php；用 docker 容器算)
-    panel_hash=$(cd "$PROJECT_DIR" && docker compose exec -T php php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$F2B_PANEL_PASS" 2>/dev/null | tr -d '\r\n')
+    # || true: PHP 容器还没起来时 exec 失败，pipefail + set -e 会直接退出，走不到下面的兜底
+    panel_hash=$(cd "$PROJECT_DIR" && docker compose exec -T php php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$F2B_PANEL_PASS" 2>/dev/null | tr -d '\r\n') || true
     # 兜底: 容器未就绪时用宿主机 php 或占位 (安装脚本会在容器起来后重算)
     if [[ -z "$panel_hash" ]] && command -v php &>/dev/null; then
         panel_hash=$(php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$F2B_PANEL_PASS" 2>/dev/null | tr -d '\r\n')
@@ -2777,7 +3267,31 @@ setup_f2b_panel() {
     # VERSION / README
     echo "1.0.0" > "$panel_root/VERSION"
 
-    # nginx 片段: location /f2b/ -> 面板 public 目录 (容器内挂到 /var/www/html/_f2b)
+    _f2b_write_panel_inc
+
+    # 凭据写入 .credentials (幂等)
+    if [[ -f "$CREDENTIALS_FILE" ]]; then
+        sed -i '/^解封面板/d' "$CREDENTIALS_FILE" 2>/dev/null || true
+    fi
+    {
+        echo "解封面板地址: https://$DOMAIN/f2b/"
+        echo "解封面板用户: ${F2B_PANEL_USER}"
+        echo "解封面板密码: ${F2B_PANEL_PASS}"
+    } >> "$CREDENTIALS_FILE"
+    chmod 600 "$CREDENTIALS_FILE" 2>/dev/null || true
+
+    # 若容器此刻未就绪、hash 为空，记录待办: 安装脚本/收尾会重算
+    if [[ -z "$panel_hash" ]]; then
+        F2B_PANEL_HASH_PENDING=1
+        warn "PHP 容器未就绪，面板密码哈希稍后在容器启动后生成 (见收尾步骤)"
+    fi
+
+    log "fail2ban 面板项目创建完成: $panel_root (访问 https://$DOMAIN/f2b/)"
+}
+
+# 生成 nginx 片段 location /f2b/ 并注入主域名 443 server 块 (幂等)。
+# --setup-waf 与 --update-f2b-panel 都会调用，保证 /f2b/ 入口一定存在。
+_f2b_write_panel_inc() {
     local panel_inc panel_inc_in_container
     if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
         panel_inc="$PROJECT_DIR/volumes/nginx/config/nginx/f2b-panel.inc"
@@ -2813,25 +3327,6 @@ location /f2b/ {
 EOFPANELINC
 
     _inject_panel_include "$panel_inc_in_container"
-
-    # 凭据写入 .credentials (幂等)
-    if [[ -f "$CREDENTIALS_FILE" ]]; then
-        sed -i '/^解封面板/d' "$CREDENTIALS_FILE" 2>/dev/null || true
-    fi
-    {
-        echo "解封面板地址: https://$DOMAIN/f2b/"
-        echo "解封面板用户: ${F2B_PANEL_USER}"
-        echo "解封面板密码: ${F2B_PANEL_PASS}"
-    } >> "$CREDENTIALS_FILE"
-    chmod 600 "$CREDENTIALS_FILE" 2>/dev/null || true
-
-    # 若容器此刻未就绪、hash 为空，记录待办: 安装脚本/收尾会重算
-    if [[ -z "$panel_hash" ]]; then
-        F2B_PANEL_HASH_PENDING=1
-        warn "PHP 容器未就绪，面板密码哈希稍后在容器启动后生成 (见收尾步骤)"
-    fi
-
-    log "fail2ban 面板项目创建完成: $panel_root (访问 https://$DOMAIN/f2b/)"
 }
 
 # 生成面板 PHP 源码 (public/ + lib/ + config/)
@@ -2839,6 +3334,8 @@ _f2b_write_panel_files() {
     local root="$1" pass_hash="$2" sess="$3" csrf="$4"
 
     # ---- config/panel.php ----
+    # 传入 "__keep__" 表示只升级面板代码、保留现有账号密码 (见 cmd_update_f2b_panel)
+    if [[ "$pass_hash" != "__keep__" ]]; then
     cat > "$root/config/panel.php" << EOFCFG
 <?php
 // fail2ban 面板配置 (由 deploy.sh 生成)。请勿公开此文件。
@@ -2857,6 +3354,7 @@ EOFCFG
     # 不对宿主机其他本地用户开放。文件在 public/ 之外，本就不经 web 暴露。
     chown root:82 "$root/config/panel.php" 2>/dev/null || true
     chmod 640 "$root/config/panel.php" 2>/dev/null || true
+    fi
 
     # ---- lib/auth.php ----
     cat > "$root/lib/auth.php" << 'EOFAUTH'
@@ -2877,18 +3375,18 @@ function f2b_session_start() {
 function f2b_is_logged_in() { return !empty($_SESSION['f2b_auth']); }
 
 function f2b_require_login() {
-    if (!f2b_is_logged_in()) { header('Location: login.php'); exit; }
+    // 绝对路径: 从 /f2b/api/ 下相对跳转会落到不存在的 /f2b/api/login.php
+    if (!f2b_is_logged_in()) { header('Location: /f2b/login.php'); exit; }
 }
 
 // 失败锁定: 按客户端 IP 分桶存到 f2b_dir/.login_fails (JSON: {ip:{fails,until}})。
 // 按 IP 计数而非全局——否则攻击者可持续失败把管理员永久锁在门外 (DoS)。
 function f2b_lock_file() { return f2b_cfg()['f2b_dir'] . '/.login_fails'; }
 function f2b_client_ip() {
-    // 面板经 nginx->php-fpm，优先取 nginx 传入的真实 IP；回退 REMOTE_ADDR
-    foreach (['HTTP_CF_CONNECTING_IP','HTTP_X_REAL_IP','REMOTE_ADDR'] as $k) {
-        if (!empty($_SERVER[$k]) && filter_var($_SERVER[$k], FILTER_VALIDATE_IP)) return $_SERVER[$k];
-    }
-    return 'unknown';
+    // 只用 REMOTE_ADDR。nginx 的 real_ip 已只对 Cloudflare 网段把它还原成真实访客 IP；
+    // 不能直接读 CF-Connecting-IP / X-Real-IP 请求头——客户端可随意伪造，每次换一个就能绕过锁定
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+    return filter_var($ip, FILTER_VALIDATE_IP) ? $ip : 'unknown';
 }
 function f2b_read_locks() {
     $f = f2b_lock_file();
@@ -2904,11 +3402,16 @@ function f2b_try_login($user, $pass) {
     $c = f2b_cfg();
     $ip = f2b_client_ip();
     if (f2b_is_locked()) return false;
-    $ok = hash_equals($c['user'], (string)$user) && !empty($c['pass_hash']) && password_verify($pass, $c['pass_hash']);
+    // 非字符串输入 (如 pass[]=x) 当作空串，避免 PHP 8 TypeError 500 且绕过失败计数
+    $user = is_string($user) ? $user : '';
+    $pass = is_string($pass) ? $pass : '';
+    $ok = hash_equals($c['user'], $user) && !empty($c['pass_hash']) && password_verify($pass, $c['pass_hash']);
     $all = f2b_read_locks();
-    // 顺带清理已过期的 IP 条目，避免文件无限增长
+    // 顺带清理过期条目，避免文件无限增长: 锁定已过期，且最后一次失败也在一个锁定周期之前
     $now = time();
-    foreach ($all as $k => $v) { if (($v['until'] ?? 0) < $now && ($v['fails'] ?? 0) === 0) unset($all[$k]); }
+    foreach ($all as $k => $v) {
+        if (($v['until'] ?? 0) < $now && ($v['last'] ?? 0) < $now - $c['lock_seconds']) unset($all[$k]);
+    }
     if ($ok) {
         session_regenerate_id(true);
         $_SESSION['f2b_auth'] = true;
@@ -2919,6 +3422,7 @@ function f2b_try_login($user, $pass) {
     }
     $e = $all[$ip] ?? ['fails'=>0, 'until'=>0];
     $e['fails'] = ($e['fails'] ?? 0) + 1;
+    $e['last']  = $now;
     if ($e['fails'] >= $c['max_fails']) { $e['until'] = time() + $c['lock_seconds']; $e['fails'] = 0; }
     $all[$ip] = $e;
     f2b_write_locks($all);
@@ -2932,7 +3436,7 @@ function f2b_csrf_token() {
     if (empty($_SESSION['f2b_csrf'])) { $_SESSION['f2b_csrf'] = bin2hex(random_bytes(16)); }
     return $_SESSION['f2b_csrf'];
 }
-function f2b_csrf_check($t) { return !empty($_SESSION['f2b_csrf']) && hash_equals($_SESSION['f2b_csrf'], (string)$t); }
+function f2b_csrf_check($t) { return is_string($t) && !empty($_SESSION['f2b_csrf']) && hash_equals($_SESSION['f2b_csrf'], $t); }
 EOFAUTH
 
     # ---- lib/queue.php ----
@@ -2948,6 +3452,7 @@ function f2b_enqueue($action, $ip) {
     if (!isset($map[$action])) return [false, '未知操作'];
     $ip = trim($ip);
     if (!f2b_valid_ip($ip)) return [false, '无效的 IP 地址'];
+    if ($action === 'ban' && strpos($ip, ':') !== false) return [false, 'IPv6 地址不封禁'];
     $file = f2b_cfg()['f2b_dir'] . '/' . $map[$action];
     if (@file_put_contents($file, $ip . "\n", FILE_APPEND | LOCK_EX) === false) {
         return [false, '写入队列失败 (检查目录权限)'];
@@ -2962,10 +3467,35 @@ function f2b_read_json($name) {
     if (!is_readable($f)) return null;
     return json_decode(@file_get_contents($f), true);
 }
-function f2b_banned_list() {
-    $f = f2b_cfg()['f2b_dir'] . '/banned.txt';
+function f2b_banned_list($file = 'banned.txt') {
+    $f = f2b_cfg()['f2b_dir'] . '/' . $file;
     if (!is_readable($f)) return [];
-    return array_values(array_filter(array_map('trim', file($f))));
+    // 只保留合法 IP: 该目录 PHP 进程可写，不校验的话被篡改的内容会原样输出到页面
+    return array_values(array_filter(array_map('trim', file($f)), 'f2b_valid_ip'));
+}
+
+// IP 归属国家缓存 (由 f2b_bridge.sh 每分钟批量查询写入: ip \t 国家代码 \t 国家名)
+function f2b_geo_map() {
+    static $m = null;
+    if ($m !== null) return $m;
+    $m = [];
+    $f = f2b_cfg()['f2b_dir'] . '/geo-cache.tsv';
+    if (!is_readable($f)) return $m;
+    foreach (file($f, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        $p = explode("\t", $line);
+        if (count($p) >= 3) $m[$p[0]] = ['cc' => $p[1], 'name' => $p[2]];
+    }
+    return $m;
+}
+// 国家代码 -> 国旗 emoji (两个区域指示符)
+function f2b_flag($cc) {
+    if (!preg_match('/^[A-Z]{2}$/', (string)$cc)) return '🏳️';
+    return mb_chr(0x1F1E6 + ord($cc[0]) - 65) . mb_chr(0x1F1E6 + ord($cc[1]) - 65);
+}
+function f2b_geo_label($ip) {
+    $g = f2b_geo_map()[$ip] ?? null;
+    if (!$g) return ['flag' => '🌐', 'name' => '未知'];
+    return ['flag' => f2b_flag($g['cc']), 'name' => $g['name']];
 }
 EOFQUEUE
 
@@ -3043,9 +3573,10 @@ EOFLOGOUT
 require_once dirname(__DIR__).'/lib/guard.php';
 header('Content-Type: application/json');
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); echo '{}'; exit; }
-if (!f2b_csrf_check($_POST['csrf'] ?? '')) { http_response_code(403); echo json_encode(['ok'=>false,'msg'=>'CSRF 校验失败']); exit; }
-$action = $_POST['action'] ?? '';
-$ip     = $_POST['ip'] ?? '';
+// CSRF 失败返回 400 而非 403: fail2ban 按 403 计数，旧标签页多点几次会把管理员自己封掉
+if (!f2b_csrf_check($_POST['csrf'] ?? '')) { http_response_code(400); echo json_encode(['ok'=>false,'msg'=>'会话已过期，请刷新页面后重试']); exit; }
+$action = is_string($_POST['action'] ?? null) ? $_POST['action'] : '';
+$ip     = is_string($_POST['ip'] ?? null) ? $_POST['ip'] : '';
 list($ok, $msg) = f2b_enqueue($action, $ip);
 echo json_encode(['ok'=>$ok, 'msg'=>$msg]);
 EOFACTION
@@ -3067,12 +3598,38 @@ EOFSTATS
 <?php
 require_once dirname(__DIR__).'/lib/guard.php';
 $token = f2b_csrf_token();
-$banned = f2b_banned_list();
+$banned     = f2b_banned_list();
+$banned_ssh = f2b_banned_list('banned-sshd.txt');
 $meta   = f2b_read_json('meta.json') ?: [];
 $stats  = f2b_read_json('stats.json') ?: [];
 $hits   = $meta['hits'] ?? [];
 $whitelist = $meta['whitelist'] ?? [];
 $blocked24 = $stats['blocked_total'] ?? 0;
+$top_ips   = $stats['top_ips'] ?? [];
+
+// 封禁列表: 网站 + SSH 合并，每页 10 条
+$rows = [];
+foreach ($banned as $ip)     $rows[] = ['ip' => $ip, 'jail' => '网站', 'hits' => (int)($hits[$ip] ?? 0)];
+foreach ($banned_ssh as $ip) $rows[] = ['ip' => $ip, 'jail' => 'SSH',  'hits' => null];
+$total_all = count($rows);
+
+// 搜索: 按 IP 子串匹配 (支持输入前缀如 "106.8." 查一整段)，只保留 IP 合法字符
+$q = preg_replace('/[^0-9a-fA-F.:]/', '', (string)($_GET['q'] ?? ''));
+$q = substr($q, 0, 45);
+if ($q !== '') {
+    $rows = array_values(array_filter($rows, fn($r) => stripos($r['ip'], $q) !== false));
+}
+// 搜索词是完整 IP: 判断它当前的状态，便于直接封禁/解封
+$q_is_ip       = $q !== '' && filter_var($q, FILTER_VALIDATE_IP) !== false;
+$q_banned      = $q_is_ip && (in_array($q, $banned, true) || in_array($q, $banned_ssh, true));
+// IPv6 不封 (白名单里的 ::/0)，搜索 IPv6 时直接显示为白名单，不给封禁按钮
+$q_whitelisted = $q_is_ip && (in_array($q, $whitelist, true) || strpos($q, ':') !== false);
+
+$per_page = 10;
+$total    = count($rows);
+$pages    = max(1, (int)ceil($total / $per_page));
+$page     = min($pages, max(1, (int)($_GET['page'] ?? 1)));
+$page_rows = array_slice($rows, ($page - 1) * $per_page, $per_page);
 ?>
 <!DOCTYPE html><html lang="zh-CN" class="dark"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -3088,7 +3645,7 @@ $blocked24 = $stats['blocked_total'] ?? 0;
     <div class="flex items-center gap-3">
       <span class="text-3xl">🛡️</span>
       <div><h1 class="text-lg font-semibold">fail2ban 面板</h1>
-      <p class="text-xs text-slate-400">WAF / 限流触发的封禁管理</p></div>
+      <p class="text-xs text-slate-400">WAF / 限流 / SSH 爆破触发的封禁管理</p></div>
     </div>
     <a href="logout.php" class="text-sm text-slate-400 hover:text-slate-200">退出登录</a>
   </header>
@@ -3097,7 +3654,8 @@ $blocked24 = $stats['blocked_total'] ?? 0;
   <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
     <div class="rounded-2xl bg-slate-900 border border-slate-800 p-5">
       <div class="text-xs text-slate-400">当前封禁 IP</div>
-      <div class="text-3xl font-bold mt-1"><?= count($banned) ?></div>
+      <div class="text-3xl font-bold mt-1"><?= $total_all ?></div>
+      <div class="text-xs text-slate-500 mt-1">网站 <?= count($banned) ?> · SSH <?= count($banned_ssh) ?></div>
     </div>
     <div class="rounded-2xl bg-slate-900 border border-slate-800 p-5">
       <div class="text-xs text-slate-400">日志内拦截次数 (444/429/403)</div>
@@ -3133,26 +3691,92 @@ $blocked24 = $stats['blocked_total'] ?? 0;
 
   <!-- 封禁列表 -->
   <div class="rounded-2xl bg-slate-900 border border-slate-800 overflow-hidden mb-6">
-    <h2 class="text-sm font-medium px-5 py-4 border-b border-slate-800">当前封禁 IP</h2>
+    <div class="flex flex-wrap items-center justify-between gap-3 px-5 py-4 border-b border-slate-800">
+      <h2 class="text-sm font-medium">当前封禁 IP
+        <span class="text-slate-500 font-normal">
+          <?= $q !== '' ? '(匹配 '.$total.' / 共 '.$total_all.' 个)' : '(共 '.$total_all.' 个)' ?>
+        </span>
+      </h2>
+      <form method="get" class="flex items-center gap-2">
+        <input name="q" value="<?= htmlspecialchars($q) ?>" placeholder="搜索 IP 或网段前缀，如 106.8."
+               autocomplete="off" spellcheck="false"
+               class="w-60 px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700 focus:border-indigo-500 outline-none text-sm font-mono">
+        <button class="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">搜索</button>
+        <?php if ($q !== ''): ?><a href="?" class="text-xs text-slate-400 hover:text-slate-200">清除</a><?php endif; ?>
+      </form>
+    </div>
+    <?php if ($q_is_ip): ?>
+    <!-- 搜索的是完整 IP: 显示其状态并给出对应操作 -->
+    <div class="flex flex-wrap items-center gap-3 px-5 py-3 border-b border-slate-800 bg-slate-950/40 text-sm">
+      <span class="font-mono"><?= htmlspecialchars($q) ?></span>
+      <?php $g = f2b_geo_label($q); ?><span class="text-slate-400"><?= $g['flag'] ?> <?= htmlspecialchars($g['name']) ?></span>
+      <?php if ($q_whitelisted): ?>
+        <span class="px-2 py-0.5 rounded text-xs bg-emerald-900/60 text-emerald-200">已在白名单</span>
+      <?php elseif ($q_banned): ?>
+        <span class="px-2 py-0.5 rounded text-xs bg-rose-900/60 text-rose-200">封禁中</span>
+        <button onclick="doAction('unban','<?= htmlspecialchars($q, ENT_QUOTES) ?>')" class="px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs">解封</button>
+        <button onclick="doAction('whitelist','<?= htmlspecialchars($q, ENT_QUOTES) ?>')" class="px-3 py-1 rounded bg-emerald-700 hover:bg-emerald-600 text-xs">加白</button>
+      <?php else: ?>
+        <span class="px-2 py-0.5 rounded text-xs bg-slate-800 text-slate-300">未封禁</span>
+        <button onclick="doAction('ban','<?= htmlspecialchars($q, ENT_QUOTES) ?>')" class="px-3 py-1 rounded bg-rose-600 hover:bg-rose-500 text-xs">封禁</button>
+        <button onclick="doAction('whitelist','<?= htmlspecialchars($q, ENT_QUOTES) ?>')" class="px-3 py-1 rounded bg-emerald-700 hover:bg-emerald-600 text-xs">加白</button>
+      <?php endif; ?>
+    </div>
+    <?php endif; ?>
+    <div class="overflow-x-auto">
     <table class="w-full text-sm">
       <thead class="text-xs text-slate-500 uppercase">
-        <tr><th class="text-left px-5 py-2">IP</th><th class="text-left px-5 py-2">命中次数</th><th class="text-right px-5 py-2">操作</th></tr>
+        <tr>
+          <th class="text-left px-5 py-2">IP</th>
+          <th class="text-left px-5 py-2">国家/地区</th>
+          <th class="text-left px-5 py-2">来源</th>
+          <th class="text-left px-5 py-2">命中次数</th>
+          <th class="text-right px-5 py-2">操作</th>
+        </tr>
       </thead>
       <tbody id="banTable">
-      <?php if (empty($banned)): ?>
-        <tr><td colspan="3" class="text-center text-slate-500 py-8">当前没有被封禁的 IP 🎉</td></tr>
-      <?php else: foreach ($banned as $ip): ?>
+      <?php if (!$total): ?>
+        <tr><td colspan="5" class="text-center text-slate-500 py-8"><?= $q !== '' ? '没有匹配「'.htmlspecialchars($q).'」的封禁 IP' : '当前没有被封禁的 IP 🎉' ?></td></tr>
+      <?php else: foreach ($page_rows as $r): $ip = $r['ip']; $g = f2b_geo_label($ip); $ipq = htmlspecialchars($ip, ENT_QUOTES); ?>
         <tr class="border-t border-slate-800">
-          <td class="px-5 py-3 font-mono"><?= htmlspecialchars($ip) ?></td>
-          <td class="px-5 py-3"><?= (int)($hits[$ip] ?? 0) ?></td>
+          <td class="px-5 py-3">
+            <button onclick="copyText('<?= $ipq ?>')" title="点击复制" class="font-mono hover:text-indigo-300"><?= htmlspecialchars($ip) ?> <span class="text-slate-500 text-xs">⧉</span></button>
+          </td>
+          <td class="px-5 py-3 whitespace-nowrap"><?= $g['flag'] ?> <?= htmlspecialchars($g['name']) ?></td>
+          <td class="px-5 py-3">
+            <span class="px-2 py-0.5 rounded text-xs <?= $r['jail'] === 'SSH' ? 'bg-amber-900/60 text-amber-200' : 'bg-slate-800 text-slate-300' ?>"><?= $r['jail'] ?></span>
+          </td>
+          <td class="px-5 py-3"><?= $r['hits'] === null ? '<span class="text-slate-500">—</span>' : (int)$r['hits'] ?></td>
           <td class="px-5 py-3 text-right whitespace-nowrap">
-            <button onclick="doAction('unban','<?= htmlspecialchars($ip) ?>')" class="px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs">解封</button>
-            <button onclick="doAction('whitelist','<?= htmlspecialchars($ip) ?>')" class="px-3 py-1 rounded bg-emerald-700 hover:bg-emerald-600 text-xs">加白</button>
+            <button onclick="doAction('unban','<?= $ipq ?>')" class="px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs">解封</button>
+            <button onclick="doAction('whitelist','<?= $ipq ?>')" class="px-3 py-1 rounded bg-emerald-700 hover:bg-emerald-600 text-xs">加白</button>
           </td>
         </tr>
       <?php endforeach; endif; ?>
       </tbody>
     </table>
+    </div>
+    <?php if ($pages > 1): ?>
+    <nav class="flex items-center justify-center gap-1 px-5 py-3 border-t border-slate-800 text-sm">
+      <?php
+        // 翻页链接带上搜索词，搜索结果也能分页
+        $link = function($p, $label, $active = false, $disabled = false) use ($q) {
+            if ($disabled) return '<span class="px-3 py-1 rounded text-slate-600">'.$label.'</span>';
+            $cls = $active ? 'bg-indigo-600 text-white' : 'bg-slate-800 hover:bg-slate-700';
+            $params = ['page' => $p];
+            if ($q !== '') $params = ['q' => $q] + $params;
+            $href = '?'.htmlspecialchars(http_build_query($params), ENT_QUOTES);
+            return '<a href="'.$href.'" class="px-3 py-1 rounded '.$cls.'">'.$label.'</a>';
+        };
+        echo $link($page - 1, '‹ 上一页', false, $page <= 1);
+        $from = max(1, $page - 2); $to = min($pages, $page + 2);
+        if ($from > 1) { echo $link(1, '1'); if ($from > 2) echo '<span class="px-1 text-slate-600">…</span>'; }
+        for ($p = $from; $p <= $to; $p++) echo $link($p, (string)$p, $p === $page);
+        if ($to < $pages) { if ($to < $pages - 1) echo '<span class="px-1 text-slate-600">…</span>'; echo $link($pages, (string)$pages); }
+        echo $link($page + 1, '下一页 ›', false, $page >= $pages);
+      ?>
+    </nav>
+    <?php endif; ?>
   </div>
 
   <!-- 白名单 -->
@@ -3196,6 +3820,20 @@ function toast(msg, ok) {
   setTimeout(() => { t.style.opacity = '0'; }, 3500);
 }
 
+// 一键复制 IP (优先 Clipboard API，非安全上下文回退到 execCommand)
+async function copyText(text, okMsg) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (_) { toast('复制失败，请手动选择', false); ta.remove(); return; }
+    ta.remove();
+  }
+  toast(okMsg || ('已复制 ' + text), true);
+}
+
 // 统一动作: 封/解/白名单 -> POST action.php
 async function doAction(action, ip) {
   if (!ip) { toast('请输入 IP', false); return; }
@@ -3234,7 +3872,12 @@ async function doAction(action, ip) {
       type: 'bar',
       data: { labels: top.map(x => x.ip), datasets: [{ label: '拦截次数',
         data: top.map(x => x.count), backgroundColor: '#6366f1' }] },
-      options: { indexAxis: 'y', ...chartDefaults }
+      options: { indexAxis: 'y', ...chartDefaults,
+        scales: {
+          x: { ticks: { color: '#94a3b8' } },
+          // autoSkip: false —— 10 个 IP 标签全部显示，不再隔一个省略
+          y: { ticks: { color: '#cbd5e1', autoSkip: false, font: { family: 'ui-monospace, monospace', size: 12 } } }
+        } }
     });
   }
 })();
@@ -3313,7 +3956,7 @@ _f2b_finalize_hash() {
     fi
     [[ -z "${F2B_PANEL_PASS:-}" ]] && { warn "面板密码未知，无法回填哈希 (请用 --setup-waf 重建面板)"; return 0; }
     local h
-    h=$(cd "$PROJECT_DIR" && docker compose exec -T php php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$F2B_PANEL_PASS" 2>/dev/null | tr -d '\r\n')
+    h=$(cd "$PROJECT_DIR" && docker compose exec -T php php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$F2B_PANEL_PASS" 2>/dev/null | tr -d '\r\n') || true
     if [[ -n "$h" ]]; then
         # 转义 hash 里的 / 和 & 供 sed 安全替换
         local h_esc; h_esc=$(printf '%s' "$h" | sed -e 's/[\/&]/\\&/g')
@@ -3353,7 +3996,7 @@ cmd_reset_f2b_password() {
 
     # 生成 bcrypt 哈希
     local h
-    h=$(docker compose exec -T php php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$new_pass" 2>/dev/null | tr -d '\r\n')
+    h=$(docker compose exec -T php php -r 'echo password_hash($argv[1], PASSWORD_BCRYPT);' "$new_pass" 2>/dev/null | tr -d '\r\n') || true
     [[ -n "$h" ]] || error "密码哈希生成失败，请确认 PHP 容器正常"
 
     # 写回 panel.php (兼容原值为空或已有旧哈希两种情况；用 | 作 sed 分隔符避开哈希里的 /)
@@ -3379,6 +4022,110 @@ cmd_reset_f2b_password() {
     echo -e "  ${DIM}面板读取配置是实时的，无需重启容器，直接用新密码登录即可。${NC}"
 }
 
+# 只升级 fail2ban 面板页面代码 + 桥接脚本 + fail2ban 规则，保留现有登录密码与封禁数据。
+# (--setup-waf 会重新生成密码；已部署环境拿新功能用这个)
+cmd_update_f2b_panel() {
+    step "${ICON_GEAR} 升级 fail2ban 面板 (保留账号密码)"
+    [[ $EUID -ne 0 ]] && error "请使用 root 或 sudo 运行"
+    load_existing_env
+    local root="$PROJECT_DIR/fail2ban-panel"
+    [[ -f "$root/config/panel.php" ]] || error "未找到已安装的面板，请先运行 $0 --setup-waf"
+    command -v fail2ban-client &>/dev/null || error "fail2ban 未安装，请先运行 $0 --setup-waf"
+    detect_server_config
+    # 封禁动作改用 ipset，老环境需补装
+    install_fail2ban
+
+    # 下面会就地改写正在运行的 nginx.conf / 站点配置 / compose。先整体打包备份，
+    # 中途出错退出或新配置 nginx -t 不通过时自动还原，避免 nginx 下次重启时起不来导致全站中断
+    local nginx_cfg_paths=(docker-compose.yml)
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        nginx_cfg_paths+=(volumes/nginx/config/nginx)
+    else
+        local p
+        for p in volumes/nginx/nginx.conf volumes/nginx/waf-guard.conf volumes/nginx/conf.d; do
+            [[ -e "$PROJECT_DIR/$p" ]] && nginx_cfg_paths+=("$p")
+        done
+    fi
+    F2B_UPGRADE_BACKUP="$(mktemp /tmp/lnmp-nginx-backup.XXXXXX.tar)"
+    tar -C "$PROJECT_DIR" -cf "$F2B_UPGRADE_BACKUP" "${nginx_cfg_paths[@]}" \
+        || error "备份 nginx 配置失败，已中止 (未做任何修改)"
+    F2B_UPGRADE_DONE=0
+    trap '_f2b_upgrade_rollback' EXIT
+    info "已备份当前 nginx 配置: $F2B_UPGRADE_BACKUP"
+
+    _f2b_write_panel_files "$root" "__keep__" "" ""
+    # 日志控制放在 fail2ban 规则之前: 先把超大的 access.log 截小，fail2ban 重载时就不用扫整个大文件
+    setup_log_rotate
+    bash "$PROJECT_DIR/log_rotate.sh" 2>/dev/null || true
+
+    # nginx 层封禁 (geo 名单) + Cloudflare 真实 IP: 需重写主配置、WAF 片段与 compose 挂载
+    setup_nginx_main_config
+    setup_waf_guard
+    setup_docker_compose
+
+    # 清掉旧版「每 IP 一条」的 DROP 规则 (改用 ipset 后不再需要)。
+    # 只匹配旧脚本生成的精确格式「-A DOCKER-USER -s <IP>/32 -j DROP」，
+    # 带端口、协议等条件的规则 (用户自己加的) 不会被删
+    local rule removed=0
+    while IFS= read -r rule; do
+        [[ -n "$rule" ]] || continue
+        # shellcheck disable=SC2086
+        iptables ${rule/-A DOCKER-USER/-D DOCKER-USER} 2>/dev/null && removed=$((removed + 1))
+    done < <(iptables -S DOCKER-USER 2>/dev/null | grep -E '^-A DOCKER-USER -s [0-9.]+(/32)? -j DROP$' || true)
+    [[ $removed -gt 0 ]] && info "已清理旧版单 IP 封禁规则 $removed 条 (封禁已迁移到 ipset)"
+
+    setup_fail2ban_config
+    setup_f2b_bridge
+
+    # 补上 /f2b/ 入口 (片段 + 主域名 include)。之前 --setup-waf 中途退出的环境会缺这两样
+    _f2b_write_panel_inc
+
+    # 应用新挂载 (f2b-banned.conf) 并检查 nginx 配置
+    cd "$PROJECT_DIR" || error "无法进入项目目录"
+    info "重建 nginx 容器以应用封禁名单挂载..."
+    # 先用新 compose (已含新挂载) 起一个临时容器校验，通过后才替换正在运行的容器。
+    # linuxserver 镜像的配置由 s6 初始化脚本准备，临时容器里直接跑 nginx -t 不可靠，只做下面的事后检查
+    if [[ "$NGINX_TYPE" != "linuxserver" ]] \
+       && ! docker compose run --rm --no-deps -T --entrypoint nginx nginx -t >/dev/null 2>&1; then
+        warn "新 nginx 配置检查未通过，错误如下:"
+        docker compose run --rm --no-deps -T --entrypoint nginx nginx -t 2>&1 | tail -5 || true
+        error "已中止升级，配置将自动还原"
+    fi
+    docker compose up -d nginx
+    sleep 3
+    if docker compose exec -T nginx nginx -t >/dev/null 2>&1; then
+        docker compose exec -T nginx nginx -s reload >/dev/null 2>&1 || true
+        log "nginx 配置检查通过"
+    else
+        warn "nginx 配置检查未通过，错误如下:"
+        docker compose exec -T nginx nginx -t 2>&1 | tail -5 || true
+        error "已中止升级，配置将自动还原"
+    fi
+    F2B_UPGRADE_DONE=1
+    rm -f "$F2B_UPGRADE_BACKUP"
+    trap - EXIT
+    log "面板已升级，刷新浏览器即可 (IP 国家信息已用本地 GeoIP 库生成)"
+}
+
+# --update-f2b-panel 中途失败时还原 nginx 配置与 compose，并按旧配置重建 nginx 容器
+_f2b_upgrade_rollback() {
+    local rc=$?
+    [[ "${F2B_UPGRADE_DONE:-1}" == "1" ]] && return
+    [[ -f "${F2B_UPGRADE_BACKUP:-}" ]] || return
+    trap - EXIT
+    echo ""
+    warn "升级未完成，正在还原 nginx 配置..."
+    if tar -C "$PROJECT_DIR" -xf "$F2B_UPGRADE_BACKUP"; then
+        (cd "$PROJECT_DIR" && docker compose up -d nginx >/dev/null 2>&1 \
+            && docker compose exec -T nginx nginx -s reload >/dev/null 2>&1) || true
+        rm -f "$F2B_UPGRADE_BACKUP"
+        warn "已还原到升级前的 nginx 配置"
+    else
+        warn "自动还原失败，备份保留在: $F2B_UPGRADE_BACKUP (tar -C $PROJECT_DIR -xf 该文件 可手动还原)"
+    fi
+    exit "$rc"
+}
+
 # 将面板 include 注入主域名的 443 server 块 (幂等)
 _inject_panel_include() {
     local inc_path="$1"
@@ -3391,16 +4138,42 @@ _inject_panel_include() {
     [[ -d "$nginx_conf_dir" ]] || return 0
 
     # 定位主域名配置文件 (server_name 恰为主域名)
-    main_conf=$(grep -rlE "server_name[[:space:]]+${DOMAIN};" "$nginx_conf_dir"/*.conf 2>/dev/null | head -1)
-    [[ -z "$main_conf" ]] && { warn "未找到主域名配置，面板 include 未注入"; return 0; }
+    # 末尾 || true: 找不到时 grep 返回 1，pipefail + set -e 会让整个脚本在这里直接退出
+    # 匹配 "server_name 域名;" 或 "server_name 域名 www.域名;" 两种写法
+    [[ -n "${DOMAIN:-}" ]] || { warn "DOMAIN 为空，面板入口未注入"; return 0; }
+    # 只看含 listen 443 的文件，避免选中 80 跳转配置
+    local f
+    for f in "$nginx_conf_dir"/*.conf; do
+        [[ -f "$f" ]] || continue
+        grep -q "listen.*443" "$f" 2>/dev/null || continue
+        if grep -qE "server_name[[:space:]]+([^;]*[[:space:]])?${DOMAIN//./\\.}([[:space:]]|;)" "$f" 2>/dev/null; then
+            main_conf="$f"; break
+        fi
+    done
+    # 兜底: 安装时生成的主域名配置文件名固定为 01-<域名>.conf
+    [[ -z "$main_conf" && -f "$nginx_conf_dir/01-${DOMAIN}.conf" ]] && main_conf="$nginx_conf_dir/01-${DOMAIN}.conf"
+    if [[ -z "$main_conf" ]]; then
+        warn "在 $nginx_conf_dir 中未找到主域名 ${DOMAIN} 的 HTTPS 配置，面板入口 /f2b/ 未注入"
+        warn "可手动在主域名 443 server 块内加一行: include ${inc_path};  然后重载 nginx"
+        return 0
+    fi
 
     if grep -q "f2b-panel.inc" "$main_conf" 2>/dev/null; then
-        return 0   # 已注入
+        log "面板入口已存在: $(basename "$main_conf")"
+        return 0
     fi
-    # 在 "server {" 行后追加 include (主域名文件只有一个 443 server 块)。
-    # 用 a\ 追加而非 s///，避免 inc_path 中的 / 与 sed 分隔符冲突。
-    sed -i "/^server[[:space:]]*{/a\\    include ${inc_path};" "$main_conf"
-    log "面板 include 已注入: $(basename "$main_conf")"
+    # 只在第一个 "listen 443" 行后插入一次，确保落在 HTTPS server 块里；
+    # 用 sed /^server {/a 会插进文件里每一个 server 块 (含 80 跳转块)，location 重复导致 nginx 报错
+    awk -v inc="    include ${inc_path};" '
+        !done && /listen/ && /443/ { print; print inc; done=1; next }
+        { print }
+    ' "$main_conf" > "$main_conf.tmp" && cat "$main_conf.tmp" > "$main_conf"
+    rm -f "$main_conf.tmp"
+    if grep -q "f2b-panel.inc" "$main_conf" 2>/dev/null; then
+        log "面板入口 /f2b/ 已注入: $(basename "$main_conf")"
+    else
+        warn "面板入口注入失败: $(basename "$main_conf") 中没有 listen 443 行"
+    fi
 }
 
 # 命令行: 查看封禁列表
@@ -3409,7 +4182,13 @@ cmd_f2b_status() {
         error "fail2ban 未安装，请先运行 $0 --setup-waf"
     fi
     step "${ICON_LOCK} fail2ban 封禁状态"
+    echo -e "  ${BOLD}网站 (lnmp-nginx):${NC}"
     fail2ban-client status lnmp-nginx 2>/dev/null || error "jail lnmp-nginx 不存在，请先运行 $0 --setup-waf"
+    if fail2ban-client status sshd &>/dev/null; then
+        echo ""
+        echo -e "  ${BOLD}SSH (sshd):${NC}"
+        fail2ban-client status sshd
+    fi
 }
 
 # 命令行: 解封指定 IP
@@ -3419,11 +4198,12 @@ cmd_f2b_unban() {
     if ! command -v fail2ban-client &>/dev/null; then
         error "fail2ban 未安装"
     fi
-    if fail2ban-client set lnmp-nginx unbanip "$ip" 2>/dev/null; then
-        log "已解封: $ip"
-    else
-        warn "解封失败 (该 IP 可能未被封禁): $ip"
-    fi
+    # 网站和 SSH 两个 jail 都尝试解封
+    local ok=0 jail
+    for jail in lnmp-nginx sshd; do
+        fail2ban-client set "$jail" unbanip "$ip" &>/dev/null && { log "已从 $jail 解封: $ip"; ok=1; }
+    done
+    [[ $ok -eq 1 ]] || warn "解封失败 (该 IP 可能未被封禁): $ip"
 }
 
 # 命令行: 手动封禁指定 IP
@@ -3444,23 +4224,7 @@ cmd_f2b_ban() {
 cmd_setup_waf() {
     show_banner
     [[ $EUID -ne 0 ]] && error "请使用 root 或 sudo 运行"
-    if [[ ! -f "$PROJECT_DIR/.env" ]]; then
-        error "未找到 $PROJECT_DIR/.env，请先完成初始安装"
-    fi
-    source "$PROJECT_DIR/.env"
-    source "$PROGRESS_FILE" 2>/dev/null || true
-
-    # NGINX_TYPE 兜底探测 (与 cmd_reconfig 同逻辑)
-    local compose_file="$PROJECT_DIR/docker-compose.yml"
-    if [[ -z "${NGINX_TYPE:-}" ]]; then
-        if grep -q "linuxserver/nginx" "$compose_file" 2>/dev/null; then
-            NGINX_TYPE="linuxserver"
-        elif grep -qE "image:[[:space:]]*nginx:alpine" "$compose_file" 2>/dev/null; then
-            NGINX_TYPE="standard"
-        else
-            NGINX_TYPE="official"
-        fi
-    fi
+    load_existing_env
     detect_server_config
 
     step "${ICON_LOCK} 为现有部署启用 WAF + fail2ban"
@@ -3496,7 +4260,8 @@ cmd_setup_waf() {
     if docker compose exec -T nginx nginx -t >/dev/null 2>&1; then
         docker compose exec -T nginx nginx -s reload 2>/dev/null || docker compose restart nginx
     else
-        warn "Nginx 配置测试未通过，请检查: docker compose exec nginx nginx -t"
+        warn "Nginx 配置测试未通过，错误如下:"
+        docker compose exec -T nginx nginx -t 2>&1 | tail -5 || true
     fi
 
     # PHP 容器已就绪，回填面板密码哈希
@@ -3637,9 +4402,9 @@ docker compose exec mysql mariadb -uroot -p -e "CREATE USER 'user'@'%' IDENTIFIE
 # 查看所有数据库
 docker compose exec mysql mariadb -uroot -p -e "SHOW DATABASES;"
 
-# 备份 / 恢复数据库
-docker compose exec mysql mariadb-dump -uroot -p dbname > backup.sql
-docker compose exec -T mysql mariadb -uroot -p dbname < backup.sql
+# 备份 / 恢复数据库 (-T 重定向时无法交互输密码，直接用容器内的 root 密码环境变量)
+docker compose exec -T mysql sh -c 'exec mariadb-dump -uroot -p"\$MYSQL_ROOT_PASSWORD" --single-transaction dbname' > backup.sql
+docker compose exec -T mysql sh -c 'exec mariadb -uroot -p"\$MYSQL_ROOT_PASSWORD" dbname' < backup.sql
 
 # 忘记 / 需要重置 root 密码 (不影响数据):
 $0 --reset-mysql-password
@@ -3659,7 +4424,7 @@ docker compose exec mysql mariadb -uroot -p -e \\
   "CREATE DATABASE IF NOT EXISTS dbname CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 
 # 3. 逐个导入业务库 (--one-database 只作用于该库, mysql 系统库那段被忽略, user 表不受影响)
-docker compose exec -T mysql mariadb -uroot -p --one-database dbname < backups/db_YYYYmmdd_HHMMSS.sql
+docker compose exec -T mysql sh -c 'exec mariadb -uroot -p"\$MYSQL_ROOT_PASSWORD" --one-database dbname' < backups/db_YYYYmmdd_HHMMSS.sql
 
 # 4. 验证各库表数量
 docker compose exec mysql mariadb -uroot -p -e \\
@@ -3669,7 +4434,7 @@ docker compose exec mysql mariadb -uroot -p -e \\
 docker compose exec mysql mariadb -uroot -p -e \\
   "CREATE USER IF NOT EXISTS 'user'@'%' IDENTIFIED BY 'password'; GRANT ALL ON dbname.* TO 'user'@'%'; FLUSH PRIVILEGES;"
 \`\`\`
-> 若确需整库全导 (含 user 表): 导入后新环境 root 密码会变成旧环境的, 必须把旧环境的 \`.credentials\` 与 \`.env\` 中 MYSQL_ROOT_PASSWORD 一并同步到新环境, 再 \`docker compose down && docker compose up -d\`; 若密码错乱连不上, 用 \`$0 --reset-mysql-password\` 重置 (不影响数据)。最后把旧环境 \`volumes/php/www/\` 对应站点目录拷到新环境同路径。
+> 若确需整库全导 (含 user 表): 导入后新环境 root 密码会变成旧环境的, 必须把旧环境的 \`.credentials\` 与 \`.env\` 中 MYSQL_ROOT_PASS 一并同步到新环境, 再 \`docker compose down && docker compose up -d\`; 若密码错乱连不上, 用 \`$0 --reset-mysql-password\` 重置 (不影响数据)。最后把旧环境 \`volumes/php/www/\` 对应站点目录拷到新环境同路径。
 
 ## Redis 操作
 > 密码见 \`.credentials\` 文件, 把下面的 '你的Redis密码' 替换为实际密码
@@ -3825,14 +4590,9 @@ cmd_health() {
 
 cmd_add_subdomain() {
     step "${ICON_GLOBE} 添加子域名"
-    
-    if [[ ! -f "$PROJECT_DIR/.env" ]]; then
-        error "请先完成初始安装"
-    fi
-    source "$PROJECT_DIR/.env"
-    # Load NGINX_TYPE from progress file if not set
-    source "$PROGRESS_FILE" 2>/dev/null || true
-    
+
+    load_existing_env
+
     printf "${GREEN}  请输入新子域名 (不含主域名): ${NC}"
     IFS= read -r new_sub || new_sub=""
     [[ -z "$new_sub" ]] && error "子域名不能为空"
@@ -3859,7 +4619,7 @@ cmd_add_subdomain() {
     local ssl_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
     # 取现有配置文件的最大数字前缀 +1，避免用文件总数推算时因删除产生空洞而撞名覆盖
     local existing_max
-    existing_max=$(ls -1 "$nginx_conf_dir/" 2>/dev/null | grep -oE '^[0-9]+' | sort -n | tail -1)
+    existing_max=$(ls -1 "$nginx_conf_dir/" 2>/dev/null | grep -oE '^[0-9]+' | sort -n | tail -1) || true
     existing_max=${existing_max:-0}
     local config_num=$(( 10#$existing_max + 1 ))
     local config_prefix
@@ -3869,7 +4629,9 @@ cmd_add_subdomain() {
     cat > "$new_conf" << EOFNEWSUB
 server {
     listen 443 ssl;
+    listen 443 quic;
     http2 on;
+    http3 on;
     server_name ${new_sub}.${DOMAIN};
     root /var/www/html/${new_sub}.${DOMAIN};
     index index.php index.html;
@@ -3879,6 +4641,7 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
     ssl_prefer_server_ciphers off;
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
 
 ${waf_include}
 
@@ -3925,11 +4688,7 @@ EOFHTML
 cmd_del_subdomain() {
     step "${ICON_GLOBE} 删除子域名"
 
-    if [[ ! -f "$PROJECT_DIR/.env" ]]; then
-        error "请先完成初始安装"
-    fi
-    source "$PROJECT_DIR/.env"
-    source "$PROGRESS_FILE" 2>/dev/null || true
+    load_existing_env
 
     local nginx_conf_dir
     if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
@@ -3990,7 +4749,7 @@ cmd_del_subdomain() {
 
     # 1) 找到并备份该子域名的 conf 文件 (按 server_name 精确匹配)
     local conf_file
-    conf_file=$(grep -rlE "server_name[[:space:]]+${target};" "$nginx_conf_dir"/*.conf 2>/dev/null | head -1)
+    conf_file=$(grep -rlE "server_name[[:space:]]+${target};" "$nginx_conf_dir"/*.conf 2>/dev/null | head -1) || true
     local archive_dir="$PROJECT_DIR/deleted-sites/${target}_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$archive_dir"
     if [[ -n "$conf_file" && -f "$conf_file" ]]; then
@@ -4023,12 +4782,8 @@ cmd_del_subdomain() {
 
 cmd_add_proxy() {
     step "${ICON_GLOBE} 添加反向代理配置"
-    
-    if [[ ! -f "$PROJECT_DIR/.env" ]]; then
-        error "请先完成初始安装"
-    fi
-    source "$PROJECT_DIR/.env"
-    source "$PROGRESS_FILE" 2>/dev/null || true
+
+    load_existing_env
     
     echo ""
     echo -e "  ${BOLD}反向代理配置向导${NC}"
@@ -4074,7 +4829,7 @@ cmd_add_proxy() {
     local ssl_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
     # 取现有配置文件的最大数字前缀 +1，避免用文件总数推算导致撞名覆盖
     local existing_max
-    existing_max=$(ls -1 "$nginx_conf_dir/" 2>/dev/null | grep -oE '^[0-9]+' | sort -n | tail -1)
+    existing_max=$(ls -1 "$nginx_conf_dir/" 2>/dev/null | grep -oE '^[0-9]+' | sort -n | tail -1) || true
     existing_max=${existing_max:-0}
     local config_num=$(( 10#$existing_max + 1 ))
     local config_prefix
@@ -4090,7 +4845,9 @@ upstream ${proxy_sub}_backend {
 
 server {
     listen 443 ssl;
+    listen 443 quic;
     http2 on;
+    http3 on;
     server_name ${proxy_sub}.${DOMAIN};
 
     ssl_certificate $ssl_cert;
@@ -4099,6 +4856,7 @@ server {
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
     ssl_prefer_server_ciphers off;
 
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
     add_header Strict-Transport-Security "max-age=63072000" always;
     add_header X-Frame-Options SAMEORIGIN;
     add_header X-Content-Type-Options nosniff;
@@ -4147,12 +4905,8 @@ EOFPROXY
 
 cmd_rebuild_nginx() {
     step "${ICON_GEAR} 重新构建 Nginx 镜像"
-    
-    if [[ ! -f "$PROJECT_DIR/.env" ]]; then
-        error "请先完成初始安装"
-    fi
-    source "$PROJECT_DIR/.env"
-    source "$PROGRESS_FILE" 2>/dev/null || true
+
+    load_existing_env
     
     local current_type=${NGINX_TYPE:-official}
     echo ""
@@ -4180,6 +4934,14 @@ cmd_rebuild_nginx() {
                 3) NGINX_TYPE="standard" ;;
                 *) NGINX_TYPE="$current_type" ;;
             esac
+            # official 与 standard 共用 volumes/nginx/conf.d 等目录，可以互切；
+            # linuxserver 用 volumes/nginx/config/ 下另一套目录，站点配置、证书引用、WAF 片段
+            # 都不会自动迁移，切换后网站会全部打不开 —— 不支持在线切换
+            if [[ "$NGINX_TYPE" != "$current_type" && ( "$NGINX_TYPE" == "linuxserver" || "$current_type" == "linuxserver" ) ]]; then
+                warn "不支持在 linuxserver 与 official/standard 之间切换: 两者站点配置目录不同，切换后网站会打不开"
+                info "如需切换，请备份网站与数据库后重新安装"
+                return 0
+            fi
             if [[ "$NGINX_TYPE" != "$current_type" ]]; then
                 if [[ -f "$PROGRESS_FILE" ]]; then
                     if grep -q "^NGINX_TYPE=" "$PROGRESS_FILE"; then
@@ -4192,6 +4954,7 @@ cmd_rebuild_nginx() {
                 log "Nginx 类型已更新为: $NGINX_TYPE"
                 setup_directories
                 setup_nginx_main_config
+                setup_waf_guard
                 [[ "$NGINX_TYPE" == "official" ]] && setup_nginx_dockerfile
                 setup_docker_compose
             fi
@@ -4533,7 +5296,7 @@ cmd_reset_mysql_password() {
 
     # 1) 先检测当前记录的密码是否其实可用 (可能只是应用端配错了)
     if [[ -n "${MYSQL_ROOT_PASS:-}" ]] && docker compose ps mysql 2>/dev/null | grep -q "Up"; then
-        if docker compose exec -T -e MYSQL_PWD="$MYSQL_ROOT_PASS" mysql sh -c "mariadb -uroot -e 'SELECT 1' 2>/dev/null || mysql -uroot -e 'SELECT 1' 2>/dev/null" >/dev/null 2>&1; then
+        if MYSQL_PWD="$MYSQL_ROOT_PASS" docker compose exec -T -e MYSQL_PWD mysql sh -c "mariadb -uroot -e 'SELECT 1' 2>/dev/null || mysql -uroot -e 'SELECT 1' 2>/dev/null" >/dev/null 2>&1; then
             echo ""
             warn ".env 中记录的 root 密码其实是可用的！"
             echo -e "  ${DIM}很可能是你的应用/连接工具里的密码写错了，而不是数据库密码丢失。${NC}"
@@ -4598,7 +5361,7 @@ cmd_reset_mysql_password() {
 
     # 6) 探测客户端并重置密码 (兼容 MariaDB / MySQL)
     local cli
-    cli=$(docker exec "$reset_container" sh -c "command -v mariadb || command -v mysql" 2>/dev/null | head -1)
+    cli=$(docker exec "$reset_container" sh -c "command -v mariadb || command -v mysql" 2>/dev/null | head -1) || true
     [[ -n "$cli" ]] || cli="mariadb"
 
     info "重置 root 密码..."
@@ -4644,7 +5407,7 @@ cmd_reset_mysql_password() {
     done
     echo ""
 
-    if docker compose exec -T -e MYSQL_PWD="$new_pass" mysql sh -c "mariadb -uroot -e 'SELECT 1' 2>/dev/null || mysql -uroot -e 'SELECT 1' 2>/dev/null" >/dev/null 2>&1; then
+    if MYSQL_PWD="$new_pass" docker compose exec -T -e MYSQL_PWD mysql sh -c "mariadb -uroot -e 'SELECT 1' 2>/dev/null || mysql -uroot -e 'SELECT 1' 2>/dev/null" >/dev/null 2>&1; then
         log "root 密码重置成功！(已验证 root@localhost)"
         echo ""
         echo -e "  ${BOLD}新的 root 密码:${NC} ${GREEN}$new_pass${NC}"
@@ -4660,8 +5423,21 @@ cmd_reset_mysql_password() {
 }
 
 cmd_uninstall() {
+    [[ $EUID -ne 0 ]] && error "请使用 root 或 sudo 运行"
     step "${ICON_WARN} 卸载确认"
+
+    # 先校验要删除的目录，任何文件都还没动: 必须是本脚本部署的目录，且不能是系统目录
+    local uninstall_dir; uninstall_dir=$(cd "$PROJECT_DIR" 2>/dev/null && pwd -P) || true
+    [[ -n "$uninstall_dir" ]] || error "项目目录不存在: $PROJECT_DIR"
+    case "$uninstall_dir" in
+        /|/root|/home|/etc|/usr|/var|/opt|/srv|/tmp|/boot|/bin|/sbin|/lib|/lib64|/data)
+            error "拒绝删除系统目录 '$uninstall_dir'，请手动清理" ;;
+    esac
+    [[ "$uninstall_dir" == /home/* && "$uninstall_dir" != /home/*/* ]] && error "拒绝删除用户主目录 '$uninstall_dir'"
+    is_lnmp_project_dir "$uninstall_dir" || error "拒绝删除 '$uninstall_dir': 未找到本脚本生成的 .env 与 docker-compose.yml"
+
     echo ""
+    echo -e "  ${BOLD}将删除目录:${NC} ${CYAN}${uninstall_dir}${NC}"
     echo -e "  ${RED}警告: 此操作将删除所有数据，包括:${NC}"
     echo -e "    - Docker 容器和镜像"
     echo -e "    - 数据库数据"
@@ -4683,22 +5459,45 @@ cmd_uninstall() {
         docker compose down -v --rmi all 2>/dev/null || true
     }
     
-    # 删除 crontab 任务 (only remove lines containing backup_task.sh or renew-cert.sh from this project)
+    # 删除 crontab 任务 (only remove lines from this project: backup / renew / log rotate)
     local temp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -v "$PROJECT_DIR/backup_task.sh" | grep -v "$PROJECT_DIR/renew-cert.sh" > "$temp_cron" 2>/dev/null || true
+    crontab -l 2>/dev/null | grep -v "$PROJECT_DIR/backup_task.sh" | grep -v "$PROJECT_DIR/renew-cert.sh" \
+        | grep -v "$PROJECT_DIR/log_rotate.sh" | grep -v "$PROJECT_DIR/geoip_update.sh" \
+        | grep -v "$PROJECT_DIR/f2b_bridge.sh" > "$temp_cron" 2>/dev/null || true
     crontab "$temp_cron" 2>/dev/null || true
     rm -f "$temp_cron"
-    
-    # 备份凭据 (含明文密码，须保持 600；install -m600 原子创建，避免 cp 默认 644)
+
+    # 清理 fail2ban 配置: 项目目录删除后 jail 的 logpath 不存在，会让整个 fail2ban
+    # 启动失败 (连 sshd 防护也一起失效)。只删本项目生成的文件，系统自带配置不动。
+    rm -f /etc/fail2ban/jail.d/lnmp.local /etc/fail2ban/filter.d/lnmp-nginx.conf \
+          /etc/fail2ban/action.d/docker-user.conf
+    iptables  -D DOCKER-USER -m set --match-set f2b-lnmp  src -j DROP 2>/dev/null || true
+    ip6tables -D DOCKER-USER -m set --match-set f2b-lnmp6 src -j DROP 2>/dev/null || true
+    ipset destroy f2b-lnmp  2>/dev/null || true
+    ipset destroy f2b-lnmp6 2>/dev/null || true
+    if command -v fail2ban-client &>/dev/null; then
+        systemctl restart fail2ban 2>/dev/null || true
+    fi
+
+    # 凭据和数据库备份要放到项目目录「外面」: 脚本从 lnmp/deploy.sh 运行时 SCRIPT_DIR 就是项目目录，
+    # 放在那里会被下面的 rm -rf 一起删掉
+    local keep_dir; keep_dir="$(dirname "$uninstall_dir")"
+    # 凭据含明文密码，须保持 600；install -m600 原子创建，避免 cp 默认 644
     if [[ -f "$CREDENTIALS_FILE" ]]; then
-        local cred_backup="$SCRIPT_DIR/credentials_backup_$(date +%Y%m%d).txt"
+        local cred_backup="$keep_dir/lnmp_credentials_backup_$(date +%Y%m%d_%H%M%S).txt"
         install -m 600 "$CREDENTIALS_FILE" "$cred_backup" 2>/dev/null \
             || { cp "$CREDENTIALS_FILE" "$cred_backup"; chmod 600 "$cred_backup"; }
-        info "凭据已备份到 $SCRIPT_DIR/"
+        info "凭据已备份到 $cred_backup"
+    fi
+    # 数据库备份 (backups/) 移出项目目录保留
+    if [[ -d "$uninstall_dir/backups" ]] && [[ -n "$(ls -A "$uninstall_dir/backups" 2>/dev/null)" ]]; then
+        local db_keep="$keep_dir/lnmp_backups_$(date +%Y%m%d_%H%M%S)"
+        mv "$uninstall_dir/backups" "$db_keep" && chmod 700 "$db_keep" \
+            && info "数据库备份已移到 $db_keep"
     fi
     
-    # 删除目录
-    rm -rf "$PROJECT_DIR"
+    # 删除目录 (路径已在开头校验过)
+    rm -rf "$uninstall_dir"
     
     log "卸载完成"
 }
@@ -4760,7 +5559,7 @@ cmd_upgrade() {
     
     info "检查最新版本..."
     if curl -fsSL --connect-timeout 10 "$SCRIPT_URL" -o "$temp_script" 2>/dev/null; then
-        remote_version=$(grep -m1 '^VERSION=' "$temp_script" | cut -d'"' -f2)
+        remote_version=$(grep -m1 '^VERSION=' "$temp_script" | cut -d'"' -f2) || true
         
         if [[ -z "$remote_version" ]]; then
             warn "无法获取远程版本信息"
@@ -4882,8 +5681,9 @@ cmd_renew() {
     cd "$PROJECT_DIR" 2>/dev/null || error "项目目录不存在"
     
     info "检查证书续期状态..."
-    # certbot 服务 entrypoint 为常驻睡眠，需用 --entrypoint 覆盖才能执行 renew
-    if docker compose run --rm --entrypoint certbot certbot renew; then
+    # 与 renew-cert.sh 一致: 用带 Cloudflare 插件的镜像，通配符证书才能续上
+    if docker run --rm -v "$PROJECT_DIR/certbot/conf:/etc/letsencrypt" -v "$PROJECT_DIR/certbot/www:/var/www/certbot" \
+            certbot/dns-cloudflare renew; then
         info "测试 Nginx 配置..."
         if docker compose exec -T nginx nginx -t 2>/dev/null; then
             docker compose exec -T nginx nginx -s reload
@@ -4897,61 +5697,49 @@ cmd_renew() {
 }
 
 # 从现有 .env 一键重新生成所有配置并重建，把时区/内存/证书续期/备份等
+# 给已有站点 .conf 补上 HTTP/3 (QUIC)。幂等: 已含 quic 的文件跳过。
+# reuseport 全局只能一处，只给主域名 01-<域名>.conf；其余用不带 reuseport 的 listen。
+# 直接改盘上文件，调用方负责随后 nginx -t + 回滚。
+migrate_site_confs_http3() {
+    local nginx_conf_dir main_base
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/config/nginx/site-confs"
+    else
+        nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
+    fi
+    [[ -d "$nginx_conf_dir" ]] || return 0
+    main_base="01-${DOMAIN}.conf"
+
+    local f base reuse changed=0
+    for f in "$nginx_conf_dir"/*.conf; do
+        [[ -f "$f" ]] || continue
+        grep -q 'quic' "$f" 2>/dev/null && continue          # 已迁移，跳过
+        grep -qE 'listen[[:space:]]+443[[:space:]]+ssl' "$f" 2>/dev/null || continue
+        base="$(basename "$f")"
+        reuse=""; [[ "$base" == "$main_base" ]] && reuse=" reuseport"
+        # 在 "listen 443 ssl;" 后插入 quic listen；"http2 on;" 后插入 "http3 on;"；
+        # server_name 后插入 Alt-Svc (放在 server 块内、紧跟 server_name，一定在 http{} 之外的合法位置)
+        awk -v reuse="$reuse" '
+            { print }
+            /listen[[:space:]]+443[[:space:]]+ssl/ && !q { print "    listen 443 quic" reuse ";"; q=1 }
+            /http2[[:space:]]+on;/ && !h3 { print "    http3 on;"; h3=1 }
+            /server_name/ && !alt { print "    add_header Alt-Svc '\''h3=\":443\"; ma=86400'\'' always;"; alt=1 }
+        ' "$f" > "$f.h3tmp" && mv "$f.h3tmp" "$f" && changed=$((changed+1))
+    done
+    [[ $changed -gt 0 ]] && info "已为 $changed 个站点配置启用 HTTP/3"
+    return 0
+}
+
 # 修复应用到已运行的部署。数据库数据、SSL 证书、子域名配置、网站文件均不改动。
 cmd_reconfig() {
     show_banner
     step "${ICON_GEAR} 重新生成配置并应用到现有部署"
 
-    if [[ ! -f "$PROJECT_DIR/.env" ]]; then
-        error "未找到 $PROJECT_DIR/.env，请先完成初始安装"
-    fi
-
-    # 载入现有配置
-    source "$PROJECT_DIR/.env"
+    # 载入现有配置 (含旧版 .env 缺键时的 NGINX_TYPE / phpMyAdmin 探测与子域名还原)
+    load_existing_env
 
     # 重新按当前机器内存/CPU 定档，避免以默认档位生成 PHP/MySQL 参数
     detect_server_config
-
-    local compose_file="$PROJECT_DIR/docker-compose.yml"
-
-    # ---- 恢复迁移前老部署缺失的值 ----
-    # NGINX_TYPE / INSTALL_PHPMYADMIN 可能不在旧 .env 中
-    if [[ -z "${NGINX_TYPE:-}" || -z "${INSTALL_PHPMYADMIN:-}" ]]; then
-        # 进度文件若还在，优先使用
-        source "$PROGRESS_FILE" 2>/dev/null || true
-    fi
-
-    # NGINX_TYPE: 仍缺则从 docker-compose.yml 探测
-    if [[ -z "${NGINX_TYPE:-}" ]]; then
-        if [[ -f "$compose_file" ]] && grep -q "linuxserver/nginx" "$compose_file"; then
-            NGINX_TYPE="linuxserver"
-        elif [[ -f "$compose_file" ]] && grep -qE "image:[[:space:]]*nginx:alpine" "$compose_file"; then
-            NGINX_TYPE="standard"
-        else
-            # 含 lnmp-nginx-geoip2 或 nginx 使用 build: 均视为 official；兜底也是 official
-            NGINX_TYPE="official"
-        fi
-        info "自动探测 NGINX_TYPE=$NGINX_TYPE"
-    fi
-
-    # INSTALL_PHPMYADMIN: 仍缺则从 docker-compose.yml 探测
-    if [[ -z "${INSTALL_PHPMYADMIN:-}" ]]; then
-        if [[ -f "$compose_file" ]] && grep -q "phpmyadmin:" "$compose_file"; then
-            INSTALL_PHPMYADMIN="yes"
-        else
-            INSTALL_PHPMYADMIN="no"
-        fi
-        info "自动探测 INSTALL_PHPMYADMIN=$INSTALL_PHPMYADMIN"
-    fi
-
-    # 证书相关缺省
-    CERT_TYPE="${CERT_TYPE:-single}"
-    DNS_PROVIDER="${DNS_PROVIDER:-}"
-    # 子域名: .env 的 SUBDOMAINS_LIST 优先还原为数组；
-    # 若其为空则沿用从进度文件恢复的 SUBDOMAINS（避免清空已有子域名元数据）
-    if [[ -n "${SUBDOMAINS_LIST:-}" ]]; then
-        SUBDOMAINS=(${SUBDOMAINS_LIST})
-    fi
 
     # ---- 展示将执行的操作并确认 ----
     echo ""
@@ -4983,6 +5771,22 @@ cmd_reconfig() {
         return 0
     fi
 
+    # 改任何 nginx 配置前整体打包备份 (含站点 .conf 与 compose)，HTTP/3 迁移或重写后
+    # nginx -t 不通过时可整体还原，避免坏配置留在盘上导致下次重启起不来
+    local reconf_backup
+    reconf_backup="$(mktemp /tmp/lnmp-reconfig-backup.XXXXXX.tar)"
+    local reconf_paths=(docker-compose.yml)
+    if [[ "$NGINX_TYPE" == "linuxserver" ]]; then
+        [[ -d "$PROJECT_DIR/volumes/nginx/config/nginx" ]] && reconf_paths+=(volumes/nginx/config/nginx)
+    else
+        local rp
+        for rp in volumes/nginx/nginx.conf volumes/nginx/waf-guard.conf volumes/nginx/conf.d; do
+            [[ -e "$PROJECT_DIR/$rp" ]] && reconf_paths+=("$rp")
+        done
+    fi
+    tar -C "$PROJECT_DIR" -cf "$reconf_backup" "${reconf_paths[@]}" 2>/dev/null \
+        && info "已备份当前配置: $reconf_backup" || reconf_backup=""
+
     # ---- 重新生成配置文件 (复用安装期函数，全局变量已就位) ----
     setup_php_dockerfile
     setup_php_ini_config
@@ -4992,11 +5796,14 @@ cmd_reconfig() {
     setup_nginx_initial              # 重写 00-http-redirect.conf (补 /healthz 健康检查端点)，不触碰站点/子域名配置
     setup_waf_guard                  # 重写 WAF 守卫片段
     inject_waf_include               # 幂等为已有站点注入 WAF include
-    setup_docker_compose             # 重写 docker-compose.yml + .env (完成迁移值回写)
+    migrate_site_confs_http3         # 幂等为已有站点 .conf 启用 HTTP/3 (QUIC)
+    setup_docker_compose             # 重写 docker-compose.yml + .env (完成迁移值回写，含 UDP 443 端口)
     setup_backup                     # 重写 backup_task.sh (D 修复)，crontab 幂等
     setup_cert_renewal               # 重写 renew-cert.sh (A 修复)，crontab 幂等
+    setup_log_rotate                 # 日志超 10M 自动截断，crontab 幂等
     # fail2ban: 已装则刷新配置 (jail 日志路径随 NGINX_TYPE)；桥接任务幂等
     if command -v fail2ban-client &>/dev/null; then
+        install_fail2ban            # 补装 ipset (封禁动作依赖它)，已装则跳过
         setup_fail2ban_config
         setup_f2b_bridge
     fi
@@ -5013,11 +5820,27 @@ cmd_reconfig() {
         docker compose build nginx
     fi
 
-    info "重建容器 (应用时区环境变量、时区挂载、redis 内存上限等)..."
+    info "重建容器 (应用时区环境变量、时区挂载、redis 内存上限等、UDP 443)..."
     docker compose up -d
+    sleep 2
+
+    # 校验新配置 (含 HTTP/3)。不通过则从备份整体还原并重启，避免坏配置留在盘上
+    if ! docker compose exec -T nginx nginx -t >/dev/null 2>&1; then
+        warn "nginx 配置检查未通过，错误如下:"
+        docker compose exec -T nginx nginx -t 2>&1 | tail -8 || true
+        if [[ -n "$reconf_backup" && -f "$reconf_backup" ]]; then
+            warn "正在从备份还原配置..."
+            tar -C "$PROJECT_DIR" -xf "$reconf_backup" \
+                && docker compose up -d >/dev/null 2>&1 \
+                && docker compose exec -T nginx nginx -s reload >/dev/null 2>&1 || true
+            error "已还原到重配前的配置 (备份: $reconf_backup)"
+        fi
+        error "nginx 配置检查失败，请检查上面的错误"
+    fi
 
     info "重载 Nginx 配置..."
     docker compose exec -T nginx nginx -s reload 2>/dev/null || docker compose restart nginx
+    [[ -n "$reconf_backup" && -f "$reconf_backup" ]] && rm -f "$reconf_backup"
 
     echo ""
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -5037,9 +5860,25 @@ cmd_reconfig() {
 # ======================== 主安装流程 ========================
 run_full_install() {
     show_banner
-    
-    # 检查是否可以恢复
+
+    # 已部署 (有 .env 且没有未完成的进度) 时禁止直接重装: 会生成新的数据库密码 (而已有数据目录
+    # 仍是旧密码，应用与备份全部连不上)，并覆盖站点配置和网站首页。
+    if [[ -f "$PROJECT_DIR/.env" && ! -f "$PROGRESS_FILE" ]]; then
+        echo ""
+        warn "检测到已有部署: $PROJECT_DIR"
+        echo -e "  ${DIM}重新安装会生成新的数据库密码 (已有数据库仍是旧密码，网站会连不上)，${NC}"
+        echo -e "  ${DIM}并覆盖站点配置与网站首页文件。${NC}"
+        echo -e "  ${DIM}只想更新配置、保留数据，请改用: $0 --reconfig${NC}"
+        echo ""
+        printf "${RED}  确定要覆盖重装吗? 输入 'yes' 继续: ${NC}"
+        local overwrite; IFS= read -r overwrite || overwrite=""
+        [[ "$overwrite" == "yes" ]] || { info "已取消"; exit 0; }
+    fi
+
+    # 检查是否可以恢复。菜单传入的 INSTALL_FAIL2BAN 以本次选择为准，不被旧进度文件里的值覆盖
+    local menu_f2b="${INSTALL_FAIL2BAN:-}"
     if load_progress; then
+        [[ -n "$menu_f2b" ]] && INSTALL_FAIL2BAN="$menu_f2b"
         echo ""
         info "检测到未完成的安装 (阶段: $STAGE)"
         printf "${GREEN}  是否继续上次安装? [Y/n]: ${NC}"
@@ -5059,9 +5898,10 @@ run_full_install() {
             NGINX_TYPE="official"
             MYSQL_ROOT_PASS=""
             REDIS_PASSWORD=""
+            INSTALL_FAIL2BAN="${menu_f2b:-yes}"
         fi
     fi
-    
+
     # 无条件检测服务器配置: 续装时进度文件不保存档位，必须每次重新检测，
     # 否则会以默认 medium/1024MB 生成 PHP/MySQL/Nginx 配置 (档位算错)
     detect_server_config
@@ -5211,6 +6051,7 @@ run_full_install() {
     if [[ $stage_index -le 9 ]]; then
         setup_backup
         setup_cert_renewal
+        setup_log_rotate
         save_credentials
         save_progress "done"
     fi
@@ -5365,6 +6206,9 @@ main() {
             ;;
         --reset-f2b-password|--reset-f2b-pass)
             cmd_reset_f2b_password
+            ;;
+        --update-f2b-panel)
+            cmd_update_f2b_panel
             ;;
         --uninstall)
             cmd_uninstall
