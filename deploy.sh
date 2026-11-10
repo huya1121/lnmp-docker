@@ -2,8 +2,8 @@
 set -eo pipefail
 
 # ======================== 版本和配置 ========================
-VERSION="2.11.0"
-SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy.sh"
+VERSION="2.12.0"
+SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/lnmp.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
 # 脚本本身就在项目目录里 (安装时会复制一份到 lnmp/deploy.sh) 时，项目目录就是脚本所在目录，
@@ -2614,27 +2614,64 @@ if [[ -f "$SCRIPT_DIR/.rclone-backup.env" ]]; then
                 -v "$RCLONE_CONFIG_DIR:/config:ro" \
                 "$RCLONE_IMAGE" --config "$RCLONE_CONFIG_FILE" "$@"
         }
+        # Telegram 推送云端备份结果 (可选)。token 在 API URL 里，用 curl -K - 从 stdin 读配置，
+        # 不让 token/chat_id 出现在宿主机进程列表 (ps)。消息里用字面 \n 分行，curl 会转成换行。
+        tg_notify() {
+            [[ -n "${TG_BOT_TOKEN:-}" && -n "${TG_CHAT_ID:-}" ]] || return 0
+            if ! command -v curl >/dev/null 2>&1; then
+                echo "[$(date)] 已配置 Telegram 但宿主机无 curl，跳过通知"; return 0
+            fi
+            printf 'url = "https://api.telegram.org/bot%s/sendMessage"\ndata-urlencode = "chat_id=%s"\ndata-urlencode = "text=%s"\n' \
+                "$TG_BOT_TOKEN" "$TG_CHAT_ID" "$1" \
+                | curl -s --max-time 20 -K - -o /dev/null 2>>"$BACKUP_LOG" \
+                && echo "[$(date)] Telegram 已推送" || echo "[$(date)] Telegram 推送失败"
+        }
+        # 累积本次云端结果 (用字面 \n 分行)；host 与时间作抬头
+        tg_host=$(hostname 2>/dev/null || echo server)
+        tg_msg="🗄 LNMP 云端备份 [${tg_host}]\n$(date '+%F %H:%M')\n目标: ${RCLONE_REMOTE}\n"
         # 只推送本次刚生成且完整的文件 (带 $DATE 时间戳)；上一步失败未生成的文件被跳过
         pushed=0
         for f in "$DB_OUT" "$BACKUP_DIR/www_$DATE.tar.gz"; do
             [[ -f "$f" ]] || continue
+            fsize=$(du -h "$f" 2>/dev/null | cut -f1); fsize="${fsize:-?}"
             if rclone_run copy "/data/$(basename "$f")" "$RCLONE_REMOTE/" --no-traverse 2>>"$BACKUP_LOG"; then
                 echo "[$(date)] 已推送到云盘: $(basename "$f")"; pushed=1
+                tg_msg="${tg_msg}✅ 上传 $(basename "$f") (${fsize})\n"
             else
                 echo "[$(date)] 云盘推送失败: $(basename "$f")"
+                tg_msg="${tg_msg}❌ 上传失败 $(basename "$f")\n"
             fi
         done
         # 先传新再删旧: 只有本次至少成功推送一个文件，才清理云端旧备份 ——
         # 这样任意时刻云端至少有一份完整备份，坏备份/半截传输也不会覆盖掉好备份。
-        # 保留刚传上去的 *_$DATE.*，删掉云端其它所有文件 (不含本次时间戳的即旧备份)。
-        if [[ $pushed -eq 1 && "${CLOUD_KEEP_LATEST_ONLY:-1}" == "1" ]]; then
-            rclone_run_remote lsf "$RCLONE_REMOTE/" 2>/dev/null | grep -vF "_$DATE." \
-                | while IFS= read -r old; do
-                    [[ -n "$old" ]] || continue
-                    rclone_run_remote deletefile "$RCLONE_REMOTE/$old" 2>>"$BACKUP_LOG" \
-                        && echo "[$(date)] 已删除云端旧备份: $old"
-                  done
+        # 云端保留策略由 .rclone-backup.env 控制，独立于本地 BACKUP_RETENTION_DAYS：
+        #   CLOUD_RETENTION_DAYS=N           保留最近 N 天，删云端 age > N 天的文件
+        #   CLOUD_RETENTION_DAYS=0           只留最新一份 (删除所有非本次时间戳的文件)
+        #   CLOUD_RETENTION_DAYS=-1 / 留空   不自动删除 (云端只增不减)——缺省即此，不会误删
+        CLOUD_RETENTION_DAYS="${CLOUD_RETENTION_DAYS:--1}"
+        if [[ $pushed -eq 1 ]]; then
+            if [[ "$CLOUD_RETENTION_DAYS" == "0" ]]; then
+                # 只留最新一份: 删掉云端不含本次时间戳的所有文件
+                rclone_run_remote lsf "$RCLONE_REMOTE/" 2>/dev/null | grep -vF "_$DATE." \
+                    | while IFS= read -r old; do
+                        [[ -n "$old" ]] || continue
+                        rclone_run_remote deletefile "$RCLONE_REMOTE/$old" 2>>"$BACKUP_LOG" \
+                            && echo "[$(date)] 已删除云端旧备份: $old"
+                      done
+                tg_msg="${tg_msg}🧹 保留策略: 仅最新一份\n"
+            elif [[ "$CLOUD_RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]]; then
+                # 按天数保留: 删云端 age 超过 N 天的文件。本次刚传的文件 age≈0，绝不会被删。
+                if rclone_run_remote delete "$RCLONE_REMOTE/" --min-age "${CLOUD_RETENTION_DAYS}d" 2>>"$BACKUP_LOG"; then
+                    echo "[$(date)] 已清理云端超过 ${CLOUD_RETENTION_DAYS} 天的备份"
+                fi
+                tg_msg="${tg_msg}🧹 保留策略: 最近 ${CLOUD_RETENTION_DAYS} 天\n"
+            fi
+            # 其它值 (如 -1/空) 不删除
+        else
+            tg_msg="${tg_msg}⚠️ 本次没有成功上传任何文件\n"
         fi
+        # 发送 Telegram 汇总 (未配置 TG 时 tg_notify 直接 return)
+        tg_notify "$tg_msg"
     elif [[ -n "${RCLONE_REMOTE:-}" ]]; then
         echo "[$(date)] 已配置云盘但 docker 不可用或配置不全，跳过推送"
     fi
@@ -2705,6 +2742,28 @@ cmd_setup_cloud_backup() {
     echo -e "  ${DIM}通过一次性 Docker 容器运行 rclone，复用你已有的 rclone 配置 (rclone.conf) 推送备份。${NC}"
     echo -e "  ${DIM}不需要在宿主机单独安装 rclone，也不碰你现有的 rclone 容器。${NC}"
     echo ""
+    echo -e "  ${BOLD}${ICON_INFO} 开始前你需要一个配好云盘的 rclone.conf。${NC}"
+    echo -e "  ${DIM}如果还没有，先跑一次官方镜像的配置向导 (把下面的路径换成你自己的目录):${NC}"
+    echo ""
+    echo -e "    ${CYAN}mkdir -p /opt/rclone${NC}"
+    echo -e "    ${CYAN}docker run --rm -it -v /opt/rclone:/config rclone/rclone \\\\${NC}"
+    echo -e "    ${CYAN}    --config /config/rclone.conf config${NC}"
+    echo ""
+    echo -e "  ${DIM}向导里: 选 ${BOLD}n${NC}${DIM}(新建) → 起个名字(如 ${BOLD}gdrive${NC}${DIM}) → 选云盘类型(如 drive=Google Drive)${NC}"
+    echo -e "  ${DIM}        → 按提示授权。完成后 ${CYAN}/opt/rclone/rclone.conf${NC}${DIM} 就是你下面要填的配置。${NC}"
+    echo -e "  ${DIM}生成的 rclone.conf 形如:${NC}"
+    echo -e "    ${DIM}[gdrive]${NC}"
+    echo -e "    ${DIM}type = drive${NC}"
+    echo -e "    ${DIM}token = {\"access_token\":\"...\",\"refresh_token\":\"...\"}${NC}"
+    echo ""
+    echo -e "  ${DIM}想让备份在云端也加密，可在向导里再建一个 ${BOLD}crypt${NC}${DIM} 类型 remote (remote 指向 gdrive:路径)，${NC}"
+    echo -e "  ${DIM}下面「备份目标」填那个 crypt remote 即可 (文件名和内容都加密)。${NC}"
+    echo -e "  ${DIM}更多: https://rclone.org/docs/${NC}"
+    echo ""
+    printf "${GREEN}  已经有配好的 rclone.conf，继续? [Y/n]: ${NC}"
+    local go; IFS= read -r go || go=""
+    [[ "$go" =~ ^[Nn]$ ]] && { info "已取消。配好 rclone.conf 后再运行 $0 --setup-cloud-backup"; return 0; }
+    echo ""
 
     # 1) rclone 镜像 (默认官方；用户可填自己的镜像)
     echo -e "  ${DIM}用哪个 rclone 镜像? 回车用官方 ${CYAN}rclone/rclone${NC}${DIM}，或填你自己的镜像名。${NC}"
@@ -2716,10 +2775,14 @@ cmd_setup_cloud_backup() {
     #    自动探测会把真实路径当默认值回显到终端，录屏/截图会泄漏个人目录结构，故要求手动输入。
     echo ""
     echo -e "  ${DIM}rclone 配置目录: 宿主机上含 rclone.conf 的目录 (绝对路径)。${NC}"
-    echo -e "  ${DIM}如果你用 Docker 跑 rclone，就是挂到容器 /config 的那个宿主机目录。${NC}"
+    echo -e "  ${DIM}  · 按上面向导建的 → 填 ${CYAN}/opt/rclone${NC}${DIM} (里面有 rclone.conf)${NC}"
+    echo -e "  ${DIM}  · 已用 Docker 跑着 rclone → 填你 ${BOLD}-v 宿主机目录:/config${NC}${DIM} 里的那个宿主机目录${NC}"
+    echo -e "  ${DIM}    (用 ${CYAN}docker inspect <你的rclone容器名>${NC}${DIM} 查 Mounts 里挂到 /config 的 Source)${NC}"
     local cfg_dir; printf "${GREEN}  配置目录: ${NC}"; IFS= read -r cfg_dir || cfg_dir=""
     [[ -n "$cfg_dir" ]] || error "配置目录不能为空"
     [[ "$cfg_dir" = /* ]] || error "请用绝对路径 (以 / 开头)"
+    # 去掉结尾斜杠: 否则下面 ${found#$cfg_dir/} 裁剪会因双斜杠失配，拼出坏的容器内路径
+    while [[ "$cfg_dir" == */ && "$cfg_dir" != "/" ]]; do cfg_dir="${cfg_dir%/}"; done
     [[ -d "$cfg_dir" ]] || error "目录不存在: $cfg_dir"
 
     # 3) 确定 conf 文件 (容器内路径 = /config/<相对位置>)，就地校验存在
@@ -2766,7 +2829,42 @@ cmd_setup_cloud_backup() {
     rm -f /tmp/rclone-test.err
     log "云端目标可访问: $target"
 
-    # 6) 写配置文件 (600)
+    # 6) 云端保留策略 (独立于本地 BACKUP_RETENTION_DAYS)
+    echo ""
+    echo -e "  ${DIM}云端保留多少天? (与本地保留天数相互独立，可不同)${NC}"
+    echo -e "  ${DIM}  · 输入天数 N → 云端保留最近 N 天 (删 age 超 N 天的)${NC}"
+    echo -e "  ${DIM}  · 输入 0    → 只留最新一份 (每次删掉其它)${NC}"
+    echo -e "  ${DIM}  · 回车默认  → 7 天${NC}"
+    local cloud_days; printf "${GREEN}  云端保留天数 [7]: ${NC}"; IFS= read -r cloud_days || cloud_days=""
+    cloud_days="${cloud_days:-7}"
+    [[ "$cloud_days" =~ ^[0-9]+$ ]] || error "请输入非负整数 (天数) 或 0"
+
+    # 7) Telegram 推送 (可选): 每次备份后把云端结果发到 Telegram
+    echo ""
+    echo -e "  ${DIM}配置 Telegram 推送? 每次备份后把云端上传结果发到你的 Telegram (回车跳过)。${NC}"
+    echo -e "  ${DIM}  · 先找 @BotFather 建一个 bot 拿 token，再找 @userinfobot 拿你的 chat id${NC}"
+    local tg_token tg_chat
+    printf "${GREEN}  Telegram Bot Token (回车跳过): ${NC}"; IFS= read -r tg_token || tg_token=""
+    if [[ -n "$tg_token" ]]; then
+        printf "${GREEN}  Telegram Chat ID: ${NC}"; IFS= read -r tg_chat || tg_chat=""
+        [[ -n "$tg_chat" ]] || error "Chat ID 不能为空 (或回车跳过 Token 不配 Telegram)"
+        # 发一条测试消息验证 token/chat 是否有效
+        info "发送 Telegram 测试消息..."
+        if printf 'url = "https://api.telegram.org/bot%s/sendMessage"\ndata-urlencode = "chat_id=%s"\ndata-urlencode = "text=%s"\n' \
+                "$tg_token" "$tg_chat" "✅ LNMP 云端备份通知已配置" \
+                | curl -s --max-time 20 -K - -o /tmp/tg-test.out 2>/dev/null \
+            && grep -q '"ok":true' /tmp/tg-test.out; then
+            log "Telegram 测试消息已发送，请检查你的 Telegram"
+        else
+            warn "Telegram 测试失败 (token/chat id 可能有误):"
+            head -c 300 /tmp/tg-test.out 2>/dev/null; echo ""
+            rm -f /tmp/tg-test.out
+            error "请检查 Bot Token 与 Chat ID"
+        fi
+        rm -f /tmp/tg-test.out
+    fi
+
+    # 8) 写配置文件 (600)
     cat > "$RCLONE_BACKUP_ENV" << EOFRCLONE
 # 备份到云盘配置 (由 deploy.sh --setup-cloud-backup 生成，可手动编辑)
 # backup_task.sh 每次本地备份成功后读取此文件，用一次性 docker 容器跑 rclone copy 推送。
@@ -2775,16 +2873,23 @@ RCLONE_IMAGE="$rimage"
 RCLONE_CONFIG_DIR="$cfg_dir"
 RCLONE_CONFIG_FILE="$conf_in_ct"
 RCLONE_REMOTE="$target"
-# 1 = 云端只保留最新一份 (先传新再删旧); 0 = 不自动删除云端旧备份
-CLOUD_KEEP_LATEST_ONLY=1
+# 云端保留策略 (独立于本地 BACKUP_RETENTION_DAYS):
+#   N  = 保留最近 N 天 (删云端 age 超过 N 天的文件)
+#   0  = 只留最新一份 (每次删掉其它)
+#   -1 = 不自动删除 (云端只增不减)
+CLOUD_RETENTION_DAYS=$cloud_days
+# Telegram 推送 (可选): 两者都填才启用。每次备份后把云端结果发到 Telegram。
+# 留空即关闭。token 是密钥，本文件 600 权限，请勿公开。
+TG_BOT_TOKEN="$tg_token"
+TG_CHAT_ID="$tg_chat"
 EOFRCLONE
     chmod 600 "$RCLONE_BACKUP_ENV"
     log "云盘备份配置已保存: $RCLONE_BACKUP_ENV"
 
-    # 7) 确保 backup_task.sh 是最新版 (含云端推送段)
+    # 8) 确保 backup_task.sh 是最新版 (含云端推送段)
     setup_backup
 
-    # 8) 可选: 立即试跑一次
+    # 9) 可选: 立即试跑一次
     echo ""
     printf "${GREEN}  现在立即执行一次备份并推送到云盘以验证? [Y/n]: ${NC}"
     local run_now; IFS= read -r run_now || run_now=""
@@ -2802,8 +2907,9 @@ EOFRCLONE
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${GREEN}  ${ICON_OK} ${BOLD}云盘备份已配置！${NC}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "  ${DIM}每天凌晨 2 点的自动备份成功后会推送到 ${CYAN}${target}${NC}${DIM}，云端只保留最新一份。${NC}"
-    echo -e "  ${DIM}本地 backups/ 仍按 BACKUP_RETENTION_DAYS 天保留，是额外一层。${NC}"
+    local keep_desc; [[ "$cloud_days" == "0" ]] && keep_desc="只保留最新一份" || keep_desc="保留最近 ${cloud_days} 天"
+    echo -e "  ${DIM}每天凌晨 2 点的自动备份成功后会推送到 ${CYAN}${target}${NC}${DIM}，云端${keep_desc}。${NC}"
+    echo -e "  ${DIM}本地 backups/ 按 .env 的 BACKUP_RETENTION_DAYS 独立保留 (与云端互不影响)。${NC}"
     echo -e "  ${DIM}所有参数都在 ${CYAN}${RCLONE_BACKUP_ENV}${NC}${DIM} 里，可手动编辑; 删除该文件即关闭推送。${NC}"
     echo ""
 }
@@ -5891,15 +5997,37 @@ migrate_site_confs_http3() {
         nginx_conf_dir="$PROJECT_DIR/volumes/nginx/conf.d"
     fi
     [[ -d "$nginx_conf_dir" ]] || return 0
-    main_base="01-${DOMAIN}.conf"
+    local domain_re="${DOMAIN//./\\.}"
 
-    local f base reuse changed=0
+    # reuseport 全局只能一处。先找出该带 reuseport 的主域名 conf:
+    #   1) 用内容识别 (server_name 恰为主域名) 而非硬编码文件名——改过名的环境也能正确认定；
+    #   2) 若已有某个 conf 带了 reuseport (之前迁移过/手写)，就沿用它，绝不再给第二个；
+    #   3) 实在找不到主域名块，兜底给第一个待迁移的 ssl 块，保证全场有且仅有一处 reuseport。
+    local reuse_target=""
+    local f
     for f in "$nginx_conf_dir"/*.conf; do
         [[ -f "$f" ]] || continue
-        grep -q 'quic' "$f" 2>/dev/null && continue          # 已迁移，跳过
+        if grep -qE 'listen[[:space:]]+443[[:space:]]+quic[[:space:]]+reuseport' "$f" 2>/dev/null; then
+            reuse_target="$f"; break   # 已存在一处 reuseport，认它
+        fi
+    done
+    if [[ -z "$reuse_target" ]]; then
+        for f in "$nginx_conf_dir"/*.conf; do
+            [[ -f "$f" ]] || continue
+            grep -qE "server_name[[:space:]]+([^;]*[[:space:]])?${domain_re}([[:space:]]|;)" "$f" 2>/dev/null \
+                && grep -qE 'listen[[:space:]]+443[[:space:]]+ssl' "$f" 2>/dev/null \
+                && { reuse_target="$f"; break; }
+        done
+    fi
+
+    local base reuse changed=0
+    for f in "$nginx_conf_dir"/*.conf; do
+        [[ -f "$f" ]] || continue
+        # 幂等: 已含 "listen ... 443 ... quic" 才算已迁移 (精确匹配 listen 行，
+        # 不用裸 'quic'——否则 server_name quic.example.com 这类会被误判已迁移而跳过)
+        grep -qE 'listen[[:space:]]+443[[:space:]]+quic' "$f" 2>/dev/null && continue
         grep -qE 'listen[[:space:]]+443[[:space:]]+ssl' "$f" 2>/dev/null || continue
-        base="$(basename "$f")"
-        reuse=""; [[ "$base" == "$main_base" ]] && reuse=" reuseport"
+        reuse=""; [[ "$f" == "$reuse_target" ]] && reuse=" reuseport"
         # 在 "listen 443 ssl;" 后插入 quic listen；"http2 on;" 后插入 "http3 on;"；
         # server_name 后插入 Alt-Svc (放在 server 块内、紧跟 server_name，一定在 http{} 之外的合法位置)
         awk -v reuse="$reuse" '
@@ -6298,18 +6426,21 @@ show_main_menu() {
     echo ""
     echo -e "    ${CYAN}1)${NC} 安装 LNMP        ${DIM}只装 Nginx + MySQL + PHP + Redis + SSL (不含 fail2ban)${NC}"
     echo -e "    ${CYAN}2)${NC} 安装 fail2ban    ${DIM}为现有部署启用 fail2ban + 网页解封面板${NC}"
+    echo -e "    ${CYAN}3)${NC} 配置云端备份     ${DIM}把每日备份用 rclone 推送到云盘 (需已有部署)${NC}"
     echo ""
     echo -e "    ${CYAN}0)${NC} 退出"
     echo ""
     echo -e "${DIM}  说明: 选 1 的 WAF 拦截与限流照常启用，仅不安装 fail2ban 自动封禁；${NC}"
     echo -e "${DIM}        装好 LNMP 后可随时选 2 (或运行 $0 --setup-waf) 补装 fail2ban。${NC}"
+    echo -e "${DIM}        选 3 需要先配好 rclone.conf (向导内有说明)；也可用 $0 --setup-cloud-backup。${NC}"
     echo -e "${DIM}        其它运维操作请用命令行参数，如 $0 --help${NC}"
     echo ""
-    printf "${GREEN}  请输入选项 [0-2]: ${NC}"
+    printf "${GREEN}  请输入选项 [0-3]: ${NC}"
     local choice; IFS= read -r choice || choice=""
     case "$choice" in
         1) INSTALL_FAIL2BAN="no"; run_full_install ;;
         2) cmd_setup_waf ;;
+        3) cmd_setup_cloud_backup ;;
         0|"") echo -e "${DIM}  已退出${NC}"; exit 0 ;;
         *) error "无效选项: $choice" ;;
     esac
