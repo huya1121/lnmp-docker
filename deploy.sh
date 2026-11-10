@@ -2,7 +2,7 @@
 set -eo pipefail
 
 # ======================== 版本和配置 ========================
-VERSION="2.10.0"
+VERSION="2.11.0"
 SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy-lnmp.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
@@ -525,6 +525,7 @@ show_help() {
     echo ""
     echo -e "${BOLD}备份和维护:${NC}"
     echo -e "  ${CYAN}--backup${NC}         立即执行备份"
+    echo -e "  ${CYAN}--setup-cloud-backup${NC}  配置备份到云盘 (rclone，先传新再删旧)"
     echo -e "  ${CYAN}--info${NC}           显示当前配置信息"
     echo -e "  ${CYAN}--health${NC}         健康检查"
     echo ""
@@ -2588,6 +2589,57 @@ RETENTION=${BACKUP_RETENTION_DAYS:-3}
 find "$BACKUP_DIR" -name "*.sql" -mtime +$RETENTION -delete 2>/dev/null || true
 find "$BACKUP_DIR" -name "*.tar.gz" -mtime +$RETENTION -delete 2>/dev/null || true
 
+# ---- 推送到云盘 (rclone copy 走一次性 Docker 容器，可选) ----
+# 用 docker run --rm 起一个一次性 rclone 容器，复用用户已有的 rclone.conf 做 copy：
+#   - rclone copy 会阻塞到上传完成并校验，真正确认到了云端 (不像挂载点异步上传无法确认)。
+#   - 不碰用户现有的长期 rclone 容器，也不要求宿主机装 rclone 命令。
+# 所有参数都在 .rclone-backup.env 里，可手动编辑定制 (不进 .env，--reconfig 不会冲掉)。
+BACKUP_LOG="$SCRIPT_DIR/backup.log"
+if [[ -f "$SCRIPT_DIR/.rclone-backup.env" ]]; then
+    source "$SCRIPT_DIR/.rclone-backup.env"
+    # 必填项齐全且 docker 可用才推送
+    if [[ -n "${RCLONE_REMOTE:-}" && -n "${RCLONE_CONFIG_DIR:-}" ]] && command -v docker >/dev/null 2>&1; then
+        RCLONE_IMAGE="${RCLONE_IMAGE:-rclone/rclone}"
+        RCLONE_CONFIG_FILE="${RCLONE_CONFIG_FILE:-/config/rclone.conf}"
+        # 一次性容器: 只读挂载用户的 rclone 配置目录和本地 backups 目录
+        rclone_run() {
+            docker run --rm \
+                -v "$RCLONE_CONFIG_DIR:/config:ro" \
+                -v "$BACKUP_DIR:/data:ro" \
+                "$RCLONE_IMAGE" --config "$RCLONE_CONFIG_FILE" "$@"
+        }
+        # 删除用的容器 (不挂 /data，纯远端操作)
+        rclone_run_remote() {
+            docker run --rm \
+                -v "$RCLONE_CONFIG_DIR:/config:ro" \
+                "$RCLONE_IMAGE" --config "$RCLONE_CONFIG_FILE" "$@"
+        }
+        # 只推送本次刚生成且完整的文件 (带 $DATE 时间戳)；上一步失败未生成的文件被跳过
+        pushed=0
+        for f in "$DB_OUT" "$BACKUP_DIR/www_$DATE.tar.gz"; do
+            [[ -f "$f" ]] || continue
+            if rclone_run copy "/data/$(basename "$f")" "$RCLONE_REMOTE/" --no-traverse 2>>"$BACKUP_LOG"; then
+                echo "[$(date)] 已推送到云盘: $(basename "$f")"; pushed=1
+            else
+                echo "[$(date)] 云盘推送失败: $(basename "$f")"
+            fi
+        done
+        # 先传新再删旧: 只有本次至少成功推送一个文件，才清理云端旧备份 ——
+        # 这样任意时刻云端至少有一份完整备份，坏备份/半截传输也不会覆盖掉好备份。
+        # 保留刚传上去的 *_$DATE.*，删掉云端其它所有文件 (不含本次时间戳的即旧备份)。
+        if [[ $pushed -eq 1 && "${CLOUD_KEEP_LATEST_ONLY:-1}" == "1" ]]; then
+            rclone_run_remote lsf "$RCLONE_REMOTE/" 2>/dev/null | grep -vF "_$DATE." \
+                | while IFS= read -r old; do
+                    [[ -n "$old" ]] || continue
+                    rclone_run_remote deletefile "$RCLONE_REMOTE/$old" 2>>"$BACKUP_LOG" \
+                        && echo "[$(date)] 已删除云端旧备份: $old"
+                  done
+        fi
+    elif [[ -n "${RCLONE_REMOTE:-}" ]]; then
+        echo "[$(date)] 已配置云盘但 docker 不可用或配置不全，跳过推送"
+    fi
+fi
+
 # 清理超过 10MB 的日志
 LOG_FILE="$SCRIPT_DIR/backup.log"
 if [[ -f "$LOG_FILE" ]]; then
@@ -2637,6 +2689,123 @@ do_backup_now() {
     fi
     bash "$BACKUP_SCRIPT"
     log "备份完成，文件保存在 $BACKUP_DIR"
+}
+
+# 配置"备份到云盘": 用一次性 Docker 容器 (rclone/rclone 或用户自定义镜像) 把本地备份
+# copy 到云端，复用用户已有的 rclone.conf。配置写进独立的 .rclone-backup.env
+# (不进 .env，--reconfig 重写 .env 时不会被冲掉；该文件可手动编辑定制所有参数)。
+RCLONE_BACKUP_ENV="$PROJECT_DIR/.rclone-backup.env"
+cmd_setup_cloud_backup() {
+    [[ $EUID -ne 0 ]] && error "请使用 root 或 sudo 运行"
+    show_banner
+    step "${ICON_FOLDER} 配置备份到云盘 (rclone via Docker)"
+    [[ -f "$PROJECT_DIR/.env" ]] || error "未找到 $PROJECT_DIR/.env，请先完成初始安装"
+    command -v docker >/dev/null 2>&1 || error "未检测到 docker"
+
+    echo -e "  ${DIM}通过一次性 Docker 容器运行 rclone，复用你已有的 rclone 配置 (rclone.conf) 推送备份。${NC}"
+    echo -e "  ${DIM}不需要在宿主机单独安装 rclone，也不碰你现有的 rclone 容器。${NC}"
+    echo ""
+
+    # 1) rclone 镜像 (默认官方；用户可填自己的镜像)
+    echo -e "  ${DIM}用哪个 rclone 镜像? 回车用官方 ${CYAN}rclone/rclone${NC}${DIM}，或填你自己的镜像名。${NC}"
+    printf "${GREEN}  rclone 镜像 [rclone/rclone]: ${NC}"
+    local rimage; IFS= read -r rimage || rimage=""
+    rimage="${rimage:-rclone/rclone}"
+
+    # 2) rclone 配置目录 (宿主机) —— 手动输入，不做自动探测:
+    #    自动探测会把真实路径当默认值回显到终端，录屏/截图会泄漏个人目录结构，故要求手动输入。
+    echo ""
+    echo -e "  ${DIM}rclone 配置目录: 宿主机上含 rclone.conf 的目录 (绝对路径)。${NC}"
+    echo -e "  ${DIM}如果你用 Docker 跑 rclone，就是挂到容器 /config 的那个宿主机目录。${NC}"
+    local cfg_dir; printf "${GREEN}  配置目录: ${NC}"; IFS= read -r cfg_dir || cfg_dir=""
+    [[ -n "$cfg_dir" ]] || error "配置目录不能为空"
+    [[ "$cfg_dir" = /* ]] || error "请用绝对路径 (以 / 开头)"
+    [[ -d "$cfg_dir" ]] || error "目录不存在: $cfg_dir"
+
+    # 3) 确定 conf 文件 (容器内路径 = /config/<相对位置>)，就地校验存在
+    local conf_rel="rclone.conf"
+    if [[ ! -f "$cfg_dir/rclone.conf" ]]; then
+        local found; found=$(find "$cfg_dir" -maxdepth 2 -name '*.conf' 2>/dev/null | head -1) || true
+        [[ -n "$found" ]] || error "在 $cfg_dir 下未找到 rclone.conf 或任何 .conf 文件，请确认路径"
+        conf_rel="${found#$cfg_dir/}"
+        info "使用配置文件: $conf_rel"
+    fi
+    local conf_in_ct="/config/$conf_rel"
+
+    # 4) 校验: 用镜像读该配置，确认至少能列出一个 remote (配置有效)
+    info "校验配置 (用 $rimage 读取 $conf_rel)..."
+    local avail
+    avail=$(docker run --rm -v "$cfg_dir:/config:ro" "$rimage" --config "$conf_in_ct" listremotes 2>/tmp/rclone-test.err) || true
+    if [[ -z "$avail" ]]; then
+        warn "未能从该配置读出任何 remote，镜像/路径/配置可能有误:"
+        cat /tmp/rclone-test.err 2>/dev/null | head -8
+        rm -f /tmp/rclone-test.err
+        error "请检查: 镜像 $rimage、配置目录 $cfg_dir、conf 文件 $conf_rel"
+    fi
+    rm -f /tmp/rclone-test.err
+    echo -e "  ${BOLD}该配置可用的 remote:${NC}"
+    local rr; while IFS= read -r rr; do [[ -n "$rr" ]] && echo -e "    ${CYAN}${rr}${NC}"; done <<< "$avail"
+
+    # 5) 备份目标 remote:路径，校验 remote 名在上面列表里，再测连通
+    echo ""
+    echo -e "  ${DIM}备份目标，格式 ${BOLD}remote名:路径${NC}${DIM}，例如 ${CYAN}myremote:lnmp-backup${NC}"
+    printf "${GREEN}  备份目标: ${NC}"
+    local target; IFS= read -r target || target=""
+    [[ -z "$target" ]] && error "目标不能为空"
+    [[ "$target" == *:* ]] || error "格式错误，应为 remote名:路径 (如 myremote:lnmp-backup)"
+    local rname="${target%%:*}:"
+    grep -qxF "$rname" <<< "$avail" || error "remote「$rname」不在该配置里 (见上面列表)"
+
+    info "测试连通性 (在 $target 建目录)..."
+    if ! docker run --rm -v "$cfg_dir:/config:ro" "$rimage" --config "$conf_in_ct" mkdir "$target" 2>/tmp/rclone-test.err; then
+        warn "连通性测试失败:"
+        cat /tmp/rclone-test.err 2>/dev/null | head -8
+        rm -f /tmp/rclone-test.err
+        error "请检查网络与云端授权"
+    fi
+    rm -f /tmp/rclone-test.err
+    log "云端目标可访问: $target"
+
+    # 6) 写配置文件 (600)
+    cat > "$RCLONE_BACKUP_ENV" << EOFRCLONE
+# 备份到云盘配置 (由 deploy.sh --setup-cloud-backup 生成，可手动编辑)
+# backup_task.sh 每次本地备份成功后读取此文件，用一次性 docker 容器跑 rclone copy 推送。
+# 本文件独立于 .env，--reconfig 不会覆盖它。删除本文件即关闭云盘推送。
+RCLONE_IMAGE="$rimage"
+RCLONE_CONFIG_DIR="$cfg_dir"
+RCLONE_CONFIG_FILE="$conf_in_ct"
+RCLONE_REMOTE="$target"
+# 1 = 云端只保留最新一份 (先传新再删旧); 0 = 不自动删除云端旧备份
+CLOUD_KEEP_LATEST_ONLY=1
+EOFRCLONE
+    chmod 600 "$RCLONE_BACKUP_ENV"
+    log "云盘备份配置已保存: $RCLONE_BACKUP_ENV"
+
+    # 7) 确保 backup_task.sh 是最新版 (含云端推送段)
+    setup_backup
+
+    # 8) 可选: 立即试跑一次
+    echo ""
+    printf "${GREEN}  现在立即执行一次备份并推送到云盘以验证? [Y/n]: ${NC}"
+    local run_now; IFS= read -r run_now || run_now=""
+    if [[ ! "$run_now" =~ ^[Nn]$ ]]; then
+        if [[ -f "$BACKUP_SCRIPT" ]]; then
+            cd "$PROJECT_DIR" || error "无法进入项目目录"
+            bash "$BACKUP_SCRIPT"
+            echo ""
+            info "云端当前文件:"
+            docker run --rm -v "$cfg_dir:/config:ro" "$rimage" --config "$conf_in_ct" lsf "$target/" 2>/dev/null | sed 's/^/    /' || true
+        fi
+    fi
+
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}  ${ICON_OK} ${BOLD}云盘备份已配置！${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${DIM}每天凌晨 2 点的自动备份成功后会推送到 ${CYAN}${target}${NC}${DIM}，云端只保留最新一份。${NC}"
+    echo -e "  ${DIM}本地 backups/ 仍按 BACKUP_RETENTION_DAYS 天保留，是额外一层。${NC}"
+    echo -e "  ${DIM}所有参数都在 ${CYAN}${RCLONE_BACKUP_ENV}${NC}${DIM} 里，可手动编辑; 删除该文件即关闭推送。${NC}"
+    echo ""
 }
 
 # ======================== fail2ban + 网页解封面板 ========================
@@ -5496,10 +5665,24 @@ cmd_uninstall() {
             && info "数据库备份已移到 $db_keep"
     fi
     
+    # 云盘备份是异地副本，卸载不主动删除 (删了反而危险)。提示用户如何手动清理。
+    local cloud_remote="" cloud_img="" cloud_cfg="" cloud_conf=""
+    if [[ -f "$uninstall_dir/.rclone-backup.env" ]]; then
+        cloud_remote=$(grep -m1 '^RCLONE_REMOTE='      "$uninstall_dir/.rclone-backup.env" 2>/dev/null | cut -d= -f2- | tr -d '"') || true
+        cloud_img=$(   grep -m1 '^RCLONE_IMAGE='       "$uninstall_dir/.rclone-backup.env" 2>/dev/null | cut -d= -f2- | tr -d '"') || true
+        cloud_cfg=$(   grep -m1 '^RCLONE_CONFIG_DIR='  "$uninstall_dir/.rclone-backup.env" 2>/dev/null | cut -d= -f2- | tr -d '"') || true
+        cloud_conf=$(  grep -m1 '^RCLONE_CONFIG_FILE=' "$uninstall_dir/.rclone-backup.env" 2>/dev/null | cut -d= -f2- | tr -d '"') || true
+    fi
+
     # 删除目录 (路径已在开头校验过)
     rm -rf "$uninstall_dir"
-    
+
     log "卸载完成"
+    if [[ -n "$cloud_remote" ]]; then
+        echo ""
+        warn "云盘备份未删除 (异地副本需你自行决定)。如需清理，运行:"
+        echo -e "    ${CYAN}docker run --rm -v ${cloud_cfg:-<配置目录>}:/config:ro ${cloud_img:-rclone/rclone} --config ${cloud_conf:-/config/rclone.conf} delete ${cloud_remote}/${NC}"
+    fi
 }
 
 cmd_cert_only() {
@@ -6164,6 +6347,9 @@ main() {
             ;;
         --backup)
             do_backup_now
+            ;;
+        --setup-cloud-backup)
+            cmd_setup_cloud_backup
             ;;
         --info)
             cmd_info
