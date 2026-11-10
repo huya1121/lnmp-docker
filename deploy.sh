@@ -2,7 +2,7 @@
 set -eo pipefail
 
 # ======================== 版本和配置 ========================
-VERSION="2.12.1"
+VERSION="2.12.2"
 SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
@@ -2661,19 +2661,24 @@ if [[ -f "$SCRIPT_DIR/.rclone-backup.env" ]]; then
         #   CLOUD_RETENTION_DAYS=0           只留最新一份 (删除所有非本次时间戳的文件)
         #   CLOUD_RETENTION_DAYS=-1 / 留空   不自动删除 (云端只增不减)——缺省即此，不会误删
         CLOUD_RETENTION_DAYS="${CLOUD_RETENTION_DAYS:--1}"
+        # Google Drive 的 rclone 删除默认只是「移到回收站」，配额照占、30 天后才自动清空 ——
+        # 等于保留天数白设。CLOUD_PURGE_TRASH=1 (默认) 加 --drive-use-trash=false 永久删、立即释放空间。
+        # 置 0 则保留回收站行为。该标志对非 Google Drive 的 remote 被 rclone 忽略，无害。
+        del_flags=()
+        [[ "${CLOUD_PURGE_TRASH:-1}" == "1" ]] && del_flags=(--drive-use-trash=false)
         if [[ $pushed -eq 1 ]]; then
             if [[ "$CLOUD_RETENTION_DAYS" == "0" ]]; then
                 # 只留最新一份: 删掉云端不含本次时间戳的所有文件
                 rclone_run_remote lsf "$RCLONE_REMOTE/" 2>/dev/null | grep -vF "_$DATE." \
                     | while IFS= read -r old; do
                         [[ -n "$old" ]] || continue
-                        rclone_run_remote deletefile "$RCLONE_REMOTE/$old" 2>>"$BACKUP_LOG" \
+                        rclone_run_remote deletefile "${del_flags[@]}" "$RCLONE_REMOTE/$old" 2>>"$BACKUP_LOG" \
                             && echo "[$(date)] 已删除云端旧备份: $old"
                       done
                 tg_msg="${tg_msg}🧹 保留策略: 仅最新一份\n"
             elif [[ "$CLOUD_RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]]; then
                 # 按天数保留: 删云端 age 超过 N 天的文件。本次刚传的文件 age≈0，绝不会被删。
-                if rclone_run_remote delete "$RCLONE_REMOTE/" --min-age "${CLOUD_RETENTION_DAYS}d" 2>>"$BACKUP_LOG"; then
+                if rclone_run_remote delete "$RCLONE_REMOTE/" --min-age "${CLOUD_RETENTION_DAYS}d" "${del_flags[@]}" 2>>"$BACKUP_LOG"; then
                     echo "[$(date)] 已清理云端超过 ${CLOUD_RETENTION_DAYS} 天的备份"
                 fi
                 tg_msg="${tg_msg}🧹 保留策略: 最近 ${CLOUD_RETENTION_DAYS} 天\n"
@@ -2918,6 +2923,9 @@ TG_BOT_TOKEN="$tg_token"
 TG_CHAT_ID="$tg_chat"
 # TG_API_BASE: 国内服务器直连 Telegram 常被墙，可填反代镜像站根地址替代官方 (如 https://tg.example.com)；留空=官方直连。
 TG_API_BASE="$tg_base"
+# CLOUD_PURGE_TRASH: 1 (默认) = 删云端旧备份时永久删 (Google Drive 跳过回收站，立即释放空间)；
+# 0 = 删到回收站 (Google Drive 30 天后才自动清空，期间仍占配额，可能撑满网盘)。
+CLOUD_PURGE_TRASH=1
 EOFRCLONE
     chmod 600 "$RCLONE_BACKUP_ENV"
     log "云盘备份配置已保存: $RCLONE_BACKUP_ENV"
