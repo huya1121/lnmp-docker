@@ -2,7 +2,7 @@
 
 > **L**inux + **N**ginx + **M**ySQL/MariaDB + **P**HP + **R**edis，基于 Docker 的生产级自动化部署脚本。
 >
-> 版本 **v2.11.0** · 单文件 `deploy.sh` · 交互式向导 + 全套运维子命令
+> 版本 **v2.12.0** · 单文件 `deploy.sh` · 交互式向导 + 全套运维子命令
 
 一条命令把一台干净的 Linux 服务器变成带 **自动 HTTPS、WAF 防护、fail2ban 封禁、定时备份** 的 LNMP 环境。所有服务跑在 Docker 容器里，互不污染宿主机。
 
@@ -51,7 +51,7 @@
 
 ```bash
 # 1. 下载脚本
-curl -fsSL -o deploy.sh https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy.sh
+curl -fsSL -o deploy.sh https://raw.githubusercontent.com/huya1121/lnmp-docker/main/lnmp.sh
 chmod +x deploy.sh
 
 # 2. 运行完整安装向导（无参数即进入向导）
@@ -231,20 +231,24 @@ docker compose exec mysql mariadb -uroot -p -e \
 #   docker run --rm -it -v /你的/rclone-config:/config rclone/rclone --config /config/rclone.conf config
 #   如需云端也加密，建一个 crypt 类型的 remote 即可
 
-sudo ./deploy.sh --setup-cloud-backup
+sudo ./deploy.sh --setup-cloud-backup     # 或: 无参数运行 sudo ./deploy.sh 选「3) 配置云端备份」
 # 向导会问:
 #   - rclone 镜像 (回车用官方 rclone/rclone，或填你自己的镜像)
 #   - rclone 配置目录 (宿主机上含 rclone.conf 的目录，手动输入绝对路径)
 #   - 备份目标 (格式 remote名:路径，例如 myremote:lnmp-backup)
+#   - 云端保留天数 (N 天 / 0 只留最新)
+#   - Telegram Bot Token + Chat ID (选填，回车跳过；填了每次备份推送结果)
 # 向导会用该镜像读配置、列出可用 remote、做连通性测试，通过后保存并可立即试跑一次。
 ```
 
 配置完成后，每天凌晨 2 点的自动备份**成功后**会自动推送到云盘。要点：
 
 - **用 `rclone copy`（Docker 一次性容器），不走挂载点**：先在本地生成完整备份，成功后起一个 `docker run --rm` 的 rclone 容器 copy 上去。`rclone copy` 会阻塞到上传完成并校验，真正确认到了云端——不像挂载点异步上传，`cp` 成功也不代表已传到云端。
-- **先传新再删旧**：先上传带时间戳的新备份，确认成功后才删云端旧备份。任意时刻云端至少有一份完整备份；某次备份损坏或网络中断都不会覆盖掉上一份好备份。云端默认只保留最新一份。
-- **本地仍保留**：`backups/` 按 `BACKUP_RETENTION_DAYS`（默认 3 天）滚动保留，云盘是额外一层异地副本。
-- **配置独立、可手动定制**：所有参数（镜像、配置目录、容器内 conf 路径、目标 remote、是否只留最新）写在 `.rclone-backup.env`（600 权限），格式同 `.env`、可手动编辑。它**不进** `.env`，所以 `--reconfig` 不会把它冲掉。想关闭云盘推送，删除该文件即可。
+- **先传新再删旧**：先上传带时间戳的新备份，确认成功后才清理云端旧备份。任意时刻云端至少有一份完整备份；某次备份损坏或网络中断都不会覆盖掉上一份好备份。
+- **云端保留天数独立可调**：由 `.rclone-backup.env` 的 `CLOUD_RETENTION_DAYS` 控制，**与本地 `BACKUP_RETENTION_DAYS` 相互独立**——可以本地留 3 天、云端留 7 天。向导里设置：输入天数 `N` = 保留最近 N 天（删云端 age 超 N 天的）；`0` = 只留最新一份。手动编辑该文件时取值 `N` / `0` / `-1`（不自动删除，只增不减）；**留空或缺失该项时按 `-1` 处理（不删），绝不会误删异地备份**。
+- **Telegram 推送结果（可选）**：配置 `TG_BOT_TOKEN` + `TG_CHAT_ID`（向导里选填，两者都填才启用）后，每次备份会把云端上传结果（成功/失败的文件、大小、保留策略）推送到 Telegram。token 通过 `curl -K -` 从标准输入传入，不会出现在宿主机进程列表（`ps`）里；凭据存在 600 权限的 `.rclone-backup.env`。先找 `@BotFather` 建 bot 拿 token、`@userinfobot` 拿 chat id。
+- **本地仍保留**：`backups/` 按 `.env` 的 `BACKUP_RETENTION_DAYS`（默认 3 天）滚动保留，云盘是额外一层异地副本，两者互不影响。
+- **配置独立、可手动定制**：所有参数（镜像、配置目录、容器内 conf 路径、目标 remote、云端保留天数、Telegram token/chat）写在 `.rclone-backup.env`（600 权限），格式同 `.env`、可手动编辑。它**不进** `.env`，所以 `--reconfig` 只会刷新备份脚本逻辑、**不会**冲掉你这份配置。想关闭云盘推送，删除该文件即可。
 - **卸载不删云端**：`--uninstall` 不会动你的云盘备份（异地副本），只在结尾打印一条用 Docker 清理的命令供你手动执行。
 
 ---
@@ -293,20 +297,26 @@ curl -A "Baiduspider" -I https://你的域名/   # 未封：正常 200
 
 ## 📝 更新日志
 
+### v2.12.0 （2026-11-10）
+
+**新增**
+- **备份到云盘（rclone via Docker）**：新增 `--setup-cloud-backup`（无参数主菜单里也多了「3) 配置云端备份」入口），把每日备份额外推送到任意 rclone 支持的云存储（OneDrive / Google Drive / S3 等）。推送通过一次性 Docker 容器（默认官方 `rclone/rclone`，镜像可自定义）跑 `rclone copy`，复用你已有的 `rclone.conf`，无需宿主机装 rclone，也不碰你现有的 rclone 容器。`rclone copy` 阻塞到上传完成并校验，真正确认到云端（不像挂载点异步上传无法确认）；并**先传新再删旧**——先上传带时间戳的新备份、确认成功后才清理云端旧备份，任意时刻云端至少有一份完整备份，坏备份/网络中断都不会覆盖掉上一份好备份。**云端保留天数（`CLOUD_RETENTION_DAYS`）与本地 `BACKUP_RETENTION_DAYS` 独立**：向导里设 N 天或 0（只留最新）；手动编辑取 N / 0 / -1，**留空或缺失按 -1（不删）处理，绝不误删异地备份**。镜像 / 配置目录 / 目标 / 保留天数等参数都在独立的 `.rclone-backup.env`（600，可手动编辑；不进 `.env`，`--reconfig` 刷新备份脚本但不冲掉它）；本地 `backups/` 仍按原策略保留；`--uninstall` 不会删云端副本。向导要求手动输入配置目录（不自动探测，避免公开录屏/截图泄漏真实路径），并即时校验配置、列出可用 remote、测连通。
+- **Telegram 推送备份结果（可选）**：云端备份配置里可填 `TG_BOT_TOKEN` + `TG_CHAT_ID`（向导里选填，两者都填才启用），每次备份把云端上传结果（成功/失败文件、大小、保留策略）推送到 Telegram。token 经 `curl -K -` 从 stdin 传入，不进宿主机进程列表（`ps`）；凭据存在 600 权限的 `.rclone-backup.env`。配置时会发一条测试消息验证 token/chat 是否有效。详见「☁️ 备份到云盘」。
+- 无参数主菜单新增 **「3) 配置云端备份」** 入口（等价于 `--setup-cloud-backup`）。
+
 ### v2.11.0 （2026-11-09）
 
 **新增**
 - **默认启用 HTTP/3（QUIC）**：所有 HTTPS 站点（主域名、子域名、反向代理）在 `listen 443 ssl` 之外新增 `listen 443 quic` + `http3 on`，并通过 `Alt-Svc` 头通告浏览器可升级到 HTTP/3；`docker-compose.yml` 中三种 Nginx 方案都增加了 `443:443/udp` 端口映射。官方镜像（`nginx:alpine`，含自建 GeoIP2 版）、标准版与 `linuxserver/nginx` 都已内置 HTTP/3 模块，无需重新编译。
-  - `reuseport` 在整份配置里只能出现一次，因此只有主域名配置（`01-<域名>.conf`）带 `reuseport`，子域名与反向代理不带，避免 nginx 启动冲突。
+  - `reuseport` 在整份配置里只能出现一次，因此只有主域名的 server 块带 `reuseport`，子域名与反向代理不带，避免 nginx 启动冲突。`--reconfig` 迁移已有站点时**按 `server_name` 内容识别主域名**（不依赖文件名），改过名的环境也能正确认定。
   - 已部署的机器运行 `./deploy.sh --reconfig` 即可为现有站点配置补上 HTTP/3（幂等，已启用的跳过）。`--reconfig` 现在改配置前会整体备份 nginx 配置与 compose，`nginx -t` 不通过时自动整体还原，避免坏配置中断服务。
   - ⚠️ **需放行 UDP 443**：QUIC 走 UDP，宿主机防火墙 / 云安全组要额外放行 **UDP 443**，否则浏览器会静默回退到 HTTP/2。
   - ⚠️ **套 Cloudflare 橙云的域名**：浏览器到 CF 之间的 HTTP/3 由 CF 负责，而 **CF 回源不走 HTTP/3**，所以源站开 HTTP/3 对经 CF 代理的访客无感；真正用到源站 HTTP/3 的是直连 / 灰云 / 不过 CF 的域名。
-- **备份到云盘（rclone via Docker）**：新增 `--setup-cloud-backup`，把每日备份额外推送到任意 rclone 支持的云存储（OneDrive / Google Drive / S3 等）。推送通过一次性 Docker 容器（默认官方 `rclone/rclone`，镜像可自定义）跑 `rclone copy`，复用你已有的 `rclone.conf`，无需宿主机装 rclone。`rclone copy` 阻塞到上传完成并校验，真正确认到云端（不像挂载点异步上传无法确认）；并**先传新再删旧**——先上传带时间戳的新备份、确认成功后才删云端旧备份，任意时刻云端至少有一份完整备份，默认只留最新一份。镜像 / 配置目录 / 目标等参数都在独立的 `.rclone-backup.env`（600，可手动编辑；不进 `.env`，`--reconfig` 不影响）；本地 `backups/` 仍按原策略保留；`--uninstall` 不会删云端副本。详见「☁️ 备份到云盘」。
 
 ### v2.10.0 （2026-10-29）
 
 **新增**
-- 无参数运行改为**交互式主菜单**：`1) 安装 LNMP`、`2) 安装 fail2ban`，带参数的运维子命令行为不变。
+- 无参数运行改为**交互式主菜单**：`1) 安装 LNMP`、`2) 安装 fail2ban`、`3) 配置云端备份`，带参数的运维子命令行为不变。
 - 新增 `--reset-f2b-password` 子命令：重置网页解封面板登录密码（用户名固定 `admin`），回车留空自动生成 20 位强密码，明文补写 `.credentials`，无需重启容器。
 - 安装完成界面的「访问地址」直接列出**网站首页 / 子域名 / 解封面板 `/f2b/` / phpMyAdmin**。
 - 爬虫黑名单新增 `YisouSpider` 及一批中国采集 / SEO / 已停运搜索类爬虫（`EasouSpider`、`JikeSpider`、`EtaoSpider`、`YoudaoBot`、`YYSpider`、`MauiBot`、`LinkpadBot`、`Ezooms` 等）；保留百度 / 搜狗 / 360 收录。
