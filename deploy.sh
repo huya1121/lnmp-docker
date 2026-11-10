@@ -2,8 +2,8 @@
 set -eo pipefail
 
 # ======================== 版本和配置 ========================
-VERSION="2.12.0"
-SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/lnmp.sh"
+VERSION="2.12.1"
+SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
 # 脚本本身就在项目目录里 (安装时会复制一份到 lnmp/deploy.sh) 时，项目目录就是脚本所在目录，
@@ -2624,9 +2624,12 @@ if [[ -f "$SCRIPT_DIR/.rclone-backup.env" ]]; then
                 echo "[$(date)] 已配置 Telegram 但宿主机无 curl，跳过通知"; return 0
             fi
             local tg_text; tg_text=$(printf '%b' "$1")   # 把字面 \n 转成真换行
+            # 国内服务器到 api.telegram.org 常被阻断。TG_API_BASE 可换成反代镜像站
+            # (如 Cloudflare Workers 搭的 TG API 反代)，直连它即可；留空用官方地址。
+            local tg_base="${TG_API_BASE:-https://api.telegram.org}"
             local tg_resp
-            tg_resp=$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_BOT_TOKEN" \
-                | curl -s --max-time 20 -K - \
+            tg_resp=$(printf 'url = "%s/bot%s/sendMessage"\n' "$tg_base" "$TG_BOT_TOKEN" \
+                | curl -s --max-time 25 -K - \
                     --data-urlencode "chat_id=${TG_CHAT_ID}" \
                     --data-urlencode "text=${tg_text}" 2>>"$BACKUP_LOG")
             if [[ "$tg_resp" == *'"ok":true'* ]]; then
@@ -2854,25 +2857,44 @@ cmd_setup_cloud_backup() {
     echo -e "  ${DIM}  · 先找 @BotFather 建一个 bot 拿 token，再找 @userinfobot 拿你的 chat id${NC}"
     local tg_token tg_chat
     printf "${GREEN}  Telegram Bot Token (回车跳过): ${NC}"; IFS= read -r tg_token || tg_token=""
+    local tg_base=""
     if [[ -n "$tg_token" ]]; then
         printf "${GREEN}  Telegram Chat ID: ${NC}"; IFS= read -r tg_chat || tg_chat=""
         [[ -n "$tg_chat" ]] || error "Chat ID 不能为空 (或回车跳过 Token 不配 Telegram)"
-        # 发一条测试消息验证 token/chat 是否有效。
-        # 只有含 token 的 URL 经 -K - (stdin) 传入避免进 ps；chat_id/text 用命令行 --data-urlencode。
-        info "发送 Telegram 测试消息..."
+        # API 地址 (可选): 国内服务器直连 api.telegram.org 常被阻断 (卡住/超时)。
+        # 可填一个 TG API 反代镜像站 (如自建的 Cloudflare Workers 反代) 替代官方地址。
+        echo ""
+        echo -e "  ${DIM}服务器直连 Telegram 常被墙 (卡住/超时)。可填反代镜像站替代官方 API (留空=官方直连):${NC}"
+        echo -e "  ${DIM}  形如 ${CYAN}https://tg.example.com${NC}${DIM} (镜像站根地址，脚本会自动拼 /bot<token>/sendMessage)${NC}"
+        printf "${GREEN}  TG API 地址 (回车=官方): ${NC}"; IFS= read -r tg_base || tg_base=""
+        # 规范化: 去掉结尾斜杠；留空用官方
+        tg_base="${tg_base%/}"
+        local tg_base_eff="${tg_base:-https://api.telegram.org}"
+
+        # 发一条测试消息验证 token/chat。只有含 token 的 URL 经 -K - (stdin) 传入避免进 ps。
+        info "发送 Telegram 测试消息 (API: ${tg_base_eff})..."
         local tg_test_resp
-        tg_test_resp=$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$tg_token" \
-            | curl -s --max-time 20 -K - \
+        tg_test_resp=$(printf 'url = "%s/bot%s/sendMessage"\n' "$tg_base_eff" "$tg_token" \
+            | curl -s --max-time 25 -K - \
                 --data-urlencode "chat_id=${tg_chat}" \
                 --data-urlencode "text=✅ LNMP 云端备份通知已配置" 2>/dev/null)
         if [[ "$tg_test_resp" == *'"ok":true'* ]]; then
             log "Telegram 测试消息已发送，请检查你的 Telegram"
+        elif [[ -z "$tg_test_resp" ]]; then
+            warn "Telegram 无响应 (请求超时/连不上)。"
+            if [[ -z "$tg_base" ]]; then
+                echo -e "  ${DIM}最可能是${BOLD}服务器到 api.telegram.org 被阻断${NC}${DIM} (国内服务器常见)。${NC}"
+                echo -e "  ${DIM}重跑本命令，在「TG API 地址」处填一个可用的反代镜像站。${NC}"
+            else
+                echo -e "  ${DIM}镜像站 ${CYAN}${tg_base}${NC}${DIM} 无响应，请确认它可访问、且是 TG API 反代 (非网页)。${NC}"
+            fi
+            error "请排查后重试"
         else
             warn "Telegram 测试失败，API 返回:"
             printf '    %s\n' "$(printf '%s' "$tg_test_resp" | head -c 300)"
             echo -e "  ${DIM}常见原因: ${BOLD}你还没给这个 bot 发过消息${NC}${DIM} (新 bot 必须先由你在 Telegram 里找到它点 Start/发一条，它才能回发给你)；${NC}"
             echo -e "  ${DIM}或 chat id 不对 (找 @userinfobot 拿你的数字 id；推送到群组时 id 以 -100 开头)。${NC}"
-            error "请排查后重试 (token 确认无误时，多半是上面第一条)"
+            error "请排查后重试"
         fi
     fi
 
@@ -2890,10 +2912,12 @@ RCLONE_REMOTE="$target"
 #   0  = 只留最新一份 (每次删掉其它)
 #   -1 = 不自动删除 (云端只增不减)
 CLOUD_RETENTION_DAYS=$cloud_days
-# Telegram 推送 (可选): 两者都填才启用。每次备份后把云端结果发到 Telegram。
+# Telegram 推送 (可选): TG_BOT_TOKEN + TG_CHAT_ID 都填才启用。每次备份后把云端结果发到 Telegram。
 # 留空即关闭。token 是密钥，本文件 600 权限，请勿公开。
 TG_BOT_TOKEN="$tg_token"
 TG_CHAT_ID="$tg_chat"
+# TG_API_BASE: 国内服务器直连 Telegram 常被墙，可填反代镜像站根地址替代官方 (如 https://tg.example.com)；留空=官方直连。
+TG_API_BASE="$tg_base"
 EOFRCLONE
     chmod 600 "$RCLONE_BACKUP_ENV"
     log "云盘备份配置已保存: $RCLONE_BACKUP_ENV"
