@@ -3,7 +3,7 @@ set -eo pipefail
 
 # ======================== 版本和配置 ========================
 VERSION="2.11.0"
-SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/lnmp.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${SCRIPT_DIR}/lnmp"
 # 脚本本身就在项目目录里 (安装时会复制一份到 lnmp/deploy.sh) 时，项目目录就是脚本所在目录，
