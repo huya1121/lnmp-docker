@@ -2614,17 +2614,26 @@ if [[ -f "$SCRIPT_DIR/.rclone-backup.env" ]]; then
                 -v "$RCLONE_CONFIG_DIR:/config:ro" \
                 "$RCLONE_IMAGE" --config "$RCLONE_CONFIG_FILE" "$@"
         }
-        # Telegram 推送云端备份结果 (可选)。token 在 API URL 里，用 curl -K - 从 stdin 读配置，
-        # 不让 token/chat_id 出现在宿主机进程列表 (ps)。消息里用字面 \n 分行，curl 会转成换行。
+        # Telegram 推送云端备份结果 (可选)。只把含 token 的 API URL 经 curl -K - 从 stdin 传入，
+        # 不让 token 出现在宿主机进程列表 (ps)；chat_id/text 不是密钥，用普通 --data-urlencode。
+        # 注意: curl 配置文件只放 "url = ..." 这类选项；data-urlencode 必须走命令行 (配置文件里
+        # 的 data-urlencode = "k=v" 会被 curl 当未知选项拒绝)。文本里的字面 \n 由 printf 转成真换行。
         tg_notify() {
             [[ -n "${TG_BOT_TOKEN:-}" && -n "${TG_CHAT_ID:-}" ]] || return 0
             if ! command -v curl >/dev/null 2>&1; then
                 echo "[$(date)] 已配置 Telegram 但宿主机无 curl，跳过通知"; return 0
             fi
-            printf 'url = "https://api.telegram.org/bot%s/sendMessage"\ndata-urlencode = "chat_id=%s"\ndata-urlencode = "text=%s"\n' \
-                "$TG_BOT_TOKEN" "$TG_CHAT_ID" "$1" \
-                | curl -s --max-time 20 -K - -o /dev/null 2>>"$BACKUP_LOG" \
-                && echo "[$(date)] Telegram 已推送" || echo "[$(date)] Telegram 推送失败"
+            local tg_text; tg_text=$(printf '%b' "$1")   # 把字面 \n 转成真换行
+            local tg_resp
+            tg_resp=$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_BOT_TOKEN" \
+                | curl -s --max-time 20 -K - \
+                    --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                    --data-urlencode "text=${tg_text}" 2>>"$BACKUP_LOG")
+            if [[ "$tg_resp" == *'"ok":true'* ]]; then
+                echo "[$(date)] Telegram 已推送"
+            else
+                echo "[$(date)] Telegram 推送失败: $(printf '%s' "$tg_resp" | head -c 200)"
+            fi
         }
         # 累积本次云端结果 (用字面 \n 分行)；host 与时间作抬头
         tg_host=$(hostname 2>/dev/null || echo server)
@@ -2848,20 +2857,23 @@ cmd_setup_cloud_backup() {
     if [[ -n "$tg_token" ]]; then
         printf "${GREEN}  Telegram Chat ID: ${NC}"; IFS= read -r tg_chat || tg_chat=""
         [[ -n "$tg_chat" ]] || error "Chat ID 不能为空 (或回车跳过 Token 不配 Telegram)"
-        # 发一条测试消息验证 token/chat 是否有效
+        # 发一条测试消息验证 token/chat 是否有效。
+        # 只有含 token 的 URL 经 -K - (stdin) 传入避免进 ps；chat_id/text 用命令行 --data-urlencode。
         info "发送 Telegram 测试消息..."
-        if printf 'url = "https://api.telegram.org/bot%s/sendMessage"\ndata-urlencode = "chat_id=%s"\ndata-urlencode = "text=%s"\n' \
-                "$tg_token" "$tg_chat" "✅ LNMP 云端备份通知已配置" \
-                | curl -s --max-time 20 -K - -o /tmp/tg-test.out 2>/dev/null \
-            && grep -q '"ok":true' /tmp/tg-test.out; then
+        local tg_test_resp
+        tg_test_resp=$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$tg_token" \
+            | curl -s --max-time 20 -K - \
+                --data-urlencode "chat_id=${tg_chat}" \
+                --data-urlencode "text=✅ LNMP 云端备份通知已配置" 2>/dev/null)
+        if [[ "$tg_test_resp" == *'"ok":true'* ]]; then
             log "Telegram 测试消息已发送，请检查你的 Telegram"
         else
-            warn "Telegram 测试失败 (token/chat id 可能有误):"
-            head -c 300 /tmp/tg-test.out 2>/dev/null; echo ""
-            rm -f /tmp/tg-test.out
-            error "请检查 Bot Token 与 Chat ID"
+            warn "Telegram 测试失败，API 返回:"
+            printf '    %s\n' "$(printf '%s' "$tg_test_resp" | head -c 300)"
+            echo -e "  ${DIM}常见原因: ${BOLD}你还没给这个 bot 发过消息${NC}${DIM} (新 bot 必须先由你在 Telegram 里找到它点 Start/发一条，它才能回发给你)；${NC}"
+            echo -e "  ${DIM}或 chat id 不对 (找 @userinfobot 拿你的数字 id；推送到群组时 id 以 -100 开头)。${NC}"
+            error "请排查后重试 (token 确认无误时，多半是上面第一条)"
         fi
-        rm -f /tmp/tg-test.out
     fi
 
     # 8) 写配置文件 (600)
