@@ -2,7 +2,7 @@
 
 > **L**inux + **N**ginx + **M**ySQL/MariaDB + **P**HP + **R**edis，基于 Docker 的生产级自动化部署脚本。
 >
-> 版本 **v2.10.0** · 单文件 `deploy.sh` · 交互式向导 + 全套运维子命令
+> 版本 **v2.11.0** · 单文件 `deploy.sh` · 交互式向导 + 全套运维子命令
 
 一条命令把一台干净的 Linux 服务器变成带 **自动 HTTPS、WAF 防护、fail2ban 封禁、定时备份** 的 LNMP 环境。所有服务跑在 Docker 容器里，互不污染宿主机。
 
@@ -11,7 +11,7 @@
 ## ✨ 核心特性
 
 - **一键安装向导** — 交互式选择 PHP / 数据库 / Nginx 版本、域名、证书类型，全程自动。
-- **自动 HTTPS** — 集成 certbot，支持单域名证书与 DNS 通配符证书（Cloudflare / 阿里云 / DNSPod），并自动续期。
+- **自动 HTTPS + HTTP/3** — 集成 certbot，支持单域名证书与 DNS 通配符证书（Cloudflare / 阿里云 / DNSPod），并自动续期；所有 HTTPS 站点默认开启 HTTP/3（QUIC）。
 - **三种 Nginx 方案**
   - `official` — 官方 nginx:alpine + 自动编译 GeoIP2 动态模块（跟随最新稳定版）
   - `linuxserver` — linuxserver/nginx，预装 GeoIP2，开箱即用
@@ -21,7 +21,7 @@
   - 请求限速 / 并发限制，超限返回 `429`
   - fail2ban 捕获 429 累计自动封禁 IP
   - 自带**网页解封面板**（Basic Auth 保护，PHP 只写队列、root 桥接脚本执行，权限隔离）
-- **定时备份** — 自动备份数据库与配置，按天数滚动保留（默认 3 天）。
+- **定时备份** — 自动备份数据库与网站，按天数滚动保留（默认 3 天）；可选用 rclone 推送到云盘（OneDrive / Google Drive / S3 等）。
 - **多站点** — 随时添加 / 删除子域名，一键配置反向代理到宿主机服务。
 - **安全运维** — 重建镜像、重置数据库密码、重新生成配置均**不动数据卷**。
 - **断点续装** — 安装过程记录进度，中断后重跑自动从上次阶段继续。
@@ -36,7 +36,12 @@
 | 数据库 | MariaDB 10.11 | 其它 MariaDB 版本 / `mysql:8.0` 等 |
 | Nginx | official（GeoIP2） | linuxserver / standard |
 | Redis | redis:alpine | — |
+| HTTP 协议 | HTTP/1.1 + HTTP/2 + HTTP/3（QUIC，默认开启） | — |
 | PHP 扩展 | mysqli, pdo_mysql, curl, zip, mbstring, xml, gd, intl, opcache, bcmath, exif, redis | — |
+
+> **HTTP/3 需放行 UDP 443**：QUIC 走 UDP，宿主机防火墙 / 云安全组要放行 **UDP 443**（除已有的 TCP 80/443 外），否则浏览器会静默回退到 HTTP/2，看起来"没生效"。
+>
+> **套 Cloudflare 橙云的域名**：浏览器到 CF 之间的 HTTP/3 由 Cloudflare 负责，而 **CF 回源不走 HTTP/3**（只用 HTTP/1.1/2）。所以源站开 HTTP/3 对经 CF 代理的访客基本无感；真正用到源站 HTTP/3 的是直连 / 灰云 / 不过 CF 的域名。
 
 ---
 
@@ -46,7 +51,7 @@
 
 ```bash
 # 1. 下载脚本
-curl -fsSL -o deploy.sh https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy.sh
+curl -fsSL -o deploy.sh https://raw.githubusercontent.com/huya1121/lnmp-docker/main/deploy-lnmp.sh
 chmod +x deploy.sh
 
 # 2. 运行完整安装向导（无参数即进入向导）
@@ -101,6 +106,7 @@ lnmp/
 
 # ---- 备份 ----
 ./deploy.sh --backup             # 立即备份
+./deploy.sh --setup-cloud-backup # 配置备份到云盘（rclone）
 
 # ---- 域名 / 代理 ----
 ./deploy.sh --add-subdomain      # 添加子域名
@@ -213,6 +219,36 @@ docker compose exec mysql mariadb -uroot -p -e \
 
 ---
 
+## ☁️ 备份到云盘（rclone via Docker）
+
+本地备份存在 `backups/`，服务器整体丢失时也会一起没。可选把每日备份额外推送到云盘（OneDrive / Google Drive / S3 等任何 [rclone 支持的存储](https://rclone.org/overview/)）。
+
+推送通过**一次性 Docker 容器**跑 rclone 完成——复用你已有的 `rclone.conf`，无需在宿主机单独装 rclone，也不碰你现有的 rclone 容器。
+
+```bash
+# 前提: 已有一个配好 remote 的 rclone.conf (比如你已经用 Docker 跑着 rclone)。
+# 若还没有，可临时跑官方镜像配置一个 remote:
+#   docker run --rm -it -v /你的/rclone-config:/config rclone/rclone --config /config/rclone.conf config
+#   如需云端也加密，建一个 crypt 类型的 remote 即可
+
+sudo ./deploy.sh --setup-cloud-backup
+# 向导会问:
+#   - rclone 镜像 (回车用官方 rclone/rclone，或填你自己的镜像)
+#   - rclone 配置目录 (宿主机上含 rclone.conf 的目录，手动输入绝对路径)
+#   - 备份目标 (格式 remote名:路径，例如 myremote:lnmp-backup)
+# 向导会用该镜像读配置、列出可用 remote、做连通性测试，通过后保存并可立即试跑一次。
+```
+
+配置完成后，每天凌晨 2 点的自动备份**成功后**会自动推送到云盘。要点：
+
+- **用 `rclone copy`（Docker 一次性容器），不走挂载点**：先在本地生成完整备份，成功后起一个 `docker run --rm` 的 rclone 容器 copy 上去。`rclone copy` 会阻塞到上传完成并校验，真正确认到了云端——不像挂载点异步上传，`cp` 成功也不代表已传到云端。
+- **先传新再删旧**：先上传带时间戳的新备份，确认成功后才删云端旧备份。任意时刻云端至少有一份完整备份；某次备份损坏或网络中断都不会覆盖掉上一份好备份。云端默认只保留最新一份。
+- **本地仍保留**：`backups/` 按 `BACKUP_RETENTION_DAYS`（默认 3 天）滚动保留，云盘是额外一层异地副本。
+- **配置独立、可手动定制**：所有参数（镜像、配置目录、容器内 conf 路径、目标 remote、是否只留最新）写在 `.rclone-backup.env`（600 权限），格式同 `.env`、可手动编辑。它**不进** `.env`，所以 `--reconfig` 不会把它冲掉。想关闭云盘推送，删除该文件即可。
+- **卸载不删云端**：`--uninstall` 不会动你的云盘备份（异地副本），只在结尾打印一条用 Docker 清理的命令供你手动执行。
+
+---
+
 ## 🛡️ 安全模型（解封面板）
 
 网页解封面板遵循权限隔离设计：
@@ -256,6 +292,16 @@ curl -A "Baiduspider" -I https://你的域名/   # 未封：正常 200
 ---
 
 ## 📝 更新日志
+
+### v2.11.0 （2026-11-09）
+
+**新增**
+- **默认启用 HTTP/3（QUIC）**：所有 HTTPS 站点（主域名、子域名、反向代理）在 `listen 443 ssl` 之外新增 `listen 443 quic` + `http3 on`，并通过 `Alt-Svc` 头通告浏览器可升级到 HTTP/3；`docker-compose.yml` 中三种 Nginx 方案都增加了 `443:443/udp` 端口映射。官方镜像（`nginx:alpine`，含自建 GeoIP2 版）、标准版与 `linuxserver/nginx` 都已内置 HTTP/3 模块，无需重新编译。
+  - `reuseport` 在整份配置里只能出现一次，因此只有主域名配置（`01-<域名>.conf`）带 `reuseport`，子域名与反向代理不带，避免 nginx 启动冲突。
+  - 已部署的机器运行 `./deploy.sh --reconfig` 即可为现有站点配置补上 HTTP/3（幂等，已启用的跳过）。`--reconfig` 现在改配置前会整体备份 nginx 配置与 compose，`nginx -t` 不通过时自动整体还原，避免坏配置中断服务。
+  - ⚠️ **需放行 UDP 443**：QUIC 走 UDP，宿主机防火墙 / 云安全组要额外放行 **UDP 443**，否则浏览器会静默回退到 HTTP/2。
+  - ⚠️ **套 Cloudflare 橙云的域名**：浏览器到 CF 之间的 HTTP/3 由 CF 负责，而 **CF 回源不走 HTTP/3**，所以源站开 HTTP/3 对经 CF 代理的访客无感；真正用到源站 HTTP/3 的是直连 / 灰云 / 不过 CF 的域名。
+- **备份到云盘（rclone via Docker）**：新增 `--setup-cloud-backup`，把每日备份额外推送到任意 rclone 支持的云存储（OneDrive / Google Drive / S3 等）。推送通过一次性 Docker 容器（默认官方 `rclone/rclone`，镜像可自定义）跑 `rclone copy`，复用你已有的 `rclone.conf`，无需宿主机装 rclone。`rclone copy` 阻塞到上传完成并校验，真正确认到云端（不像挂载点异步上传无法确认）；并**先传新再删旧**——先上传带时间戳的新备份、确认成功后才删云端旧备份，任意时刻云端至少有一份完整备份，默认只留最新一份。镜像 / 配置目录 / 目标等参数都在独立的 `.rclone-backup.env`（600，可手动编辑；不进 `.env`，`--reconfig` 不影响）；本地 `backups/` 仍按原策略保留；`--uninstall` 不会删云端副本。详见「☁️ 备份到云盘」。
 
 ### v2.10.0 （2026-10-29）
 
